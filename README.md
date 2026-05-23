@@ -6,6 +6,10 @@ Open-source AI PR review harness. Builds semantic context slices per changed fun
 
 Early development (M1 in progress). The service skeleton is functional — webhook reception, job queue, database, and migrations all work. The review pipeline stages (index, planner, runtime, policy) are not yet implemented.
 
+## Project Maintenance
+- Lead Maintainer: [Dan Getz](https://github.com/quizwedge)
+- Major Contributor: [Evan Volgas](https://github.com/evanvolgas)
+
 ## Architecture
 
 - **Language:** Go 1.23+ (ADR-0001)
