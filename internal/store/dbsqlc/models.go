@@ -18,39 +18,41 @@ type DismissedFingerprint struct {
 	DismissedBy  string      `json:"dismissed_by"`
 	Reason       pgtype.Text `json:"reason"`
 	CreatedAt    time.Time   `json:"created_at"`
+	UpdatedAt    time.Time   `json:"updated_at"`
 }
 
 type Finding struct {
-	ID                    uuid.UUID       `json:"id"`
-	ReviewTaskID          uuid.UUID       `json:"review_task_id"`
-	PullRequestID         uuid.UUID       `json:"pull_request_id"`
-	PipelineRunID         uuid.UUID       `json:"pipeline_run_id"`
-	FilePath              string          `json:"file_path"`
-	StartLine             pgtype.Int4     `json:"start_line"`
-	EndLine               pgtype.Int4     `json:"end_line"`
-	Symbol                pgtype.Text     `json:"symbol"`
-	Category              string          `json:"category"`
-	ConfidenceTier        string          `json:"confidence_tier"`
-	ConfidenceScore       float64         `json:"confidence_score"`
-	Severity              string          `json:"severity"`
-	Title                 string          `json:"title"`
-	Body                  string          `json:"body"`
-	Suggestion            pgtype.Text     `json:"suggestion"`
-	LocationHash          string          `json:"location_hash"`
-	ContentHash           pgtype.Text     `json:"content_hash"`
-	HeadSha               string          `json:"head_sha"`
-	PostedAt              *time.Time      `json:"posted_at"`
-	ExternalCommentID       pgtype.Int8     `json:"external_comment_id"`
-	AddressedInNextCommit bool            `json:"addressed_in_next_commit"`
-	SuppressionReason     pgtype.Text     `json:"suppression_reason"`
-	DismissedAt           *time.Time      `json:"dismissed_at"`
-	DismissedBy           pgtype.Text     `json:"dismissed_by"`
-	ModelID               string          `json:"model_id"`
-	PromptTokens          pgtype.Int4     `json:"prompt_tokens"`
-	CompletionTokens      pgtype.Int4     `json:"completion_tokens"`
-	Metadata              json.RawMessage `json:"metadata"`
-	CreatedAt             time.Time       `json:"created_at"`
-	UpdatedAt             time.Time       `json:"updated_at"`
+	ID                uuid.UUID       `json:"id"`
+	ReviewTaskID      uuid.UUID       `json:"review_task_id"`
+	PullRequestID     uuid.UUID       `json:"pull_request_id"`
+	PipelineRunID     uuid.UUID       `json:"pipeline_run_id"`
+	RepoFullName      string          `json:"repo_full_name"`
+	FilePath          string          `json:"file_path"`
+	StartLine         pgtype.Int4     `json:"start_line"`
+	EndLine           pgtype.Int4     `json:"end_line"`
+	Symbol            string          `json:"symbol"`
+	Category          string          `json:"category"`
+	ConfidenceTier    string          `json:"confidence_tier"`
+	ConfidenceScore   float64         `json:"confidence_score"`
+	Severity          string          `json:"severity"`
+	Title             string          `json:"title"`
+	Body              string          `json:"body"`
+	Suggestion        pgtype.Text     `json:"suggestion"`
+	LocationHash      string          `json:"location_hash"`
+	ContentHash       pgtype.Text     `json:"content_hash"`
+	HeadSha           string          `json:"head_sha"`
+	PostedAt          *time.Time      `json:"posted_at"`
+	ExternalCommentID pgtype.Int8     `json:"external_comment_id"`
+	AddressedStatus   string          `json:"addressed_status"`
+	SuppressionReason pgtype.Text     `json:"suppression_reason"`
+	DismissedAt       *time.Time      `json:"dismissed_at"`
+	DismissedBy       pgtype.Text     `json:"dismissed_by"`
+	ModelID           string          `json:"model_id"`
+	PromptTokens      pgtype.Int4     `json:"prompt_tokens"`
+	CompletionTokens  pgtype.Int4     `json:"completion_tokens"`
+	Metadata          json.RawMessage `json:"metadata"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"`
 }
 
 type FindingEvent struct {
@@ -65,25 +67,26 @@ type FindingEvent struct {
 }
 
 type PipelineRun struct {
-	ID            uuid.UUID       `json:"id"`
-	PullRequestID uuid.UUID       `json:"pull_request_id"`
-	HeadSha       string          `json:"head_sha"`
-	Status        string          `json:"status"`
-	PromptVersion string          `json:"prompt_version"`
-	ConfigHash    string          `json:"config_hash"`
-	TaskCount     int32           `json:"task_count"`
-	FindingCount  int32           `json:"finding_count"`
-	Error         pgtype.Text     `json:"error"`
-	Metadata      json.RawMessage `json:"metadata"`
-	StartedAt     time.Time       `json:"started_at"`
-	CompletedAt   *time.Time      `json:"completed_at"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	ID                 uuid.UUID       `json:"id"`
+	PullRequestID      uuid.UUID       `json:"pull_request_id"`
+	HeadSha            string          `json:"head_sha"`
+	PromptVersion      string          `json:"prompt_version"`
+	ConfigHash         string          `json:"config_hash"`
+	Status             string          `json:"status"`
+	TasksTotal         pgtype.Int4     `json:"tasks_total"`
+	TasksCompleted     pgtype.Int4     `json:"tasks_completed"`
+	TasksFailed        pgtype.Int4     `json:"tasks_failed"`
+	FindingsTotal      pgtype.Int4     `json:"findings_total"`
+	FindingsPosted     pgtype.Int4     `json:"findings_posted"`
+	FindingsSuppressed pgtype.Int4     `json:"findings_suppressed"`
+	StartedAt          time.Time       `json:"started_at"`
+	CompletedAt        *time.Time      `json:"completed_at"`
+	Metadata           json.RawMessage `json:"metadata"`
 }
 
 type PullRequest struct {
 	ID           uuid.UUID       `json:"id"`
-	ExternalPrID   int64           `json:"external_pr_id"`
+	ExternalPrID int64           `json:"external_pr_id"`
 	RepoFullName string          `json:"repo_full_name"`
 	PrNumber     int32           `json:"pr_number"`
 	HeadSha      string          `json:"head_sha"`
@@ -102,7 +105,7 @@ type ReviewTask struct {
 	PipelineRunID uuid.UUID   `json:"pipeline_run_id"`
 	TaskType      string      `json:"task_type"`
 	FilePath      string      `json:"file_path"`
-	Symbol        pgtype.Text `json:"symbol"`
+	Symbol        string      `json:"symbol"`
 	RiskScore     float64     `json:"risk_score"`
 	ModelID       string      `json:"model_id"`
 	DiffHunk      pgtype.Text `json:"diff_hunk"`

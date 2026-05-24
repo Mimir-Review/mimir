@@ -1,39 +1,25 @@
 -- name: CreatePipelineRun :one
-INSERT INTO pipeline_runs (
-    id, pull_request_id, head_sha, status,
-    prompt_version, config_hash, metadata
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING created_at, updated_at;
+INSERT INTO pipeline_runs (pull_request_id, head_sha, prompt_version, config_hash, metadata)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING *;
 
 -- name: CompletePipelineRun :execrows
 UPDATE pipeline_runs
-SET status        = $2,
-    task_count    = $3,
-    finding_count = $4,
-    error         = $5,
-    completed_at  = now()
+SET status = $2, tasks_total = $3, tasks_completed = $4, tasks_failed = $5,
+    findings_total = $6, findings_posted = $7, findings_suppressed = $8,
+    completed_at = now()
 WHERE id = $1;
 
 -- name: GetPipelineRun :one
-SELECT id, pull_request_id, head_sha, status,
-       prompt_version, config_hash,
-       task_count, finding_count, error, metadata,
-       started_at, completed_at, created_at, updated_at
-FROM pipeline_runs
-WHERE id = $1;
+SELECT * FROM pipeline_runs WHERE id = $1;
 
 -- name: ListPipelineRunsForPR :many
-SELECT id, pull_request_id, head_sha, status,
-       prompt_version, config_hash,
-       task_count, finding_count, error, metadata,
-       started_at, completed_at, created_at, updated_at
-FROM pipeline_runs
-WHERE pull_request_id = $1
-ORDER BY created_at DESC;
+SELECT * FROM pipeline_runs WHERE pull_request_id = $1 ORDER BY started_at DESC;
 
--- name: ReconcileStalePipelineRuns :execrows
+-- name: ReconcileStalePipelineRuns :exec
 UPDATE pipeline_runs
-SET status       = 'failed',
-    error        = 'reconciled: process crashed or restarted',
-    completed_at = now()
-WHERE status = 'running';
+SET status = 'failed',
+    completed_at = now(),
+    metadata = metadata || '{"failure_reason": "abandoned: process crash or timeout"}'::jsonb
+WHERE status = 'running'
+  AND started_at < now() - $1::interval;

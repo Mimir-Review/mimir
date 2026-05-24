@@ -1,29 +1,24 @@
 -- name: CreateReviewTask :one
-INSERT INTO review_tasks (
-    id, pull_request_id, pipeline_run_id, task_type,
-    file_path, symbol, risk_score, model_id, diff_hunk, status
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING created_at;
+INSERT INTO review_tasks (pull_request_id, pipeline_run_id, task_type, file_path, symbol, risk_score, model_id, diff_hunk)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING *;
 
--- name: UpdateReviewTaskStatusRunning :execrows
+-- name: UpdateReviewTaskStatus :execrows
 UPDATE review_tasks
-SET status = $2, started_at = now()
+SET status = $2, error = $3, started_at = CASE WHEN $2 = 'running' THEN now() ELSE started_at END,
+    completed_at = CASE WHEN $2 IN ('completed', 'failed') THEN now() ELSE completed_at END
 WHERE id = $1;
 
--- name: UpdateReviewTaskStatusTerminal :execrows
-UPDATE review_tasks
-SET status = $2, error = $3, completed_at = now()
-WHERE id = $1;
+-- name: ListReviewTasksForPR :many
+SELECT * FROM review_tasks WHERE pull_request_id = $1;
 
--- name: UpdateReviewTaskStatusOther :execrows
-UPDATE review_tasks
-SET status = $2
-WHERE id = $1;
+-- name: ListReviewTasksForRun :many
+SELECT * FROM review_tasks WHERE pipeline_run_id = $1;
 
--- name: ListPendingReviewTasks :many
-SELECT id, pull_request_id, pipeline_run_id, task_type,
-       file_path, symbol, risk_score, model_id, diff_hunk,
-       status, error, started_at, completed_at, created_at
+-- name: CountCompletedAndTotal :one
+SELECT
+    COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+    COUNT(*) FILTER (WHERE status = 'failed') AS failed
 FROM review_tasks
-WHERE status = 'pending'
-ORDER BY risk_score DESC;
+WHERE pipeline_run_id = $1;

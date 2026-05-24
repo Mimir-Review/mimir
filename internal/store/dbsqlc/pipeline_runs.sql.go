@@ -8,7 +8,6 @@ package dbsqlc
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -16,29 +15,33 @@ import (
 
 const completePipelineRun = `-- name: CompletePipelineRun :execrows
 UPDATE pipeline_runs
-SET status        = $2,
-    task_count    = $3,
-    finding_count = $4,
-    error         = $5,
-    completed_at  = now()
+SET status = $2, tasks_total = $3, tasks_completed = $4, tasks_failed = $5,
+    findings_total = $6, findings_posted = $7, findings_suppressed = $8,
+    completed_at = now()
 WHERE id = $1
 `
 
 type CompletePipelineRunParams struct {
-	ID           uuid.UUID   `json:"id"`
-	Status       string      `json:"status"`
-	TaskCount    int32       `json:"task_count"`
-	FindingCount int32       `json:"finding_count"`
-	Error        pgtype.Text `json:"error"`
+	ID                 uuid.UUID   `json:"id"`
+	Status             string      `json:"status"`
+	TasksTotal         pgtype.Int4 `json:"tasks_total"`
+	TasksCompleted     pgtype.Int4 `json:"tasks_completed"`
+	TasksFailed        pgtype.Int4 `json:"tasks_failed"`
+	FindingsTotal      pgtype.Int4 `json:"findings_total"`
+	FindingsPosted     pgtype.Int4 `json:"findings_posted"`
+	FindingsSuppressed pgtype.Int4 `json:"findings_suppressed"`
 }
 
 func (q *Queries) CompletePipelineRun(ctx context.Context, arg CompletePipelineRunParams) (int64, error) {
 	result, err := q.db.Exec(ctx, completePipelineRun,
 		arg.ID,
 		arg.Status,
-		arg.TaskCount,
-		arg.FindingCount,
-		arg.Error,
+		arg.TasksTotal,
+		arg.TasksCompleted,
+		arg.TasksFailed,
+		arg.FindingsTotal,
+		arg.FindingsPosted,
+		arg.FindingsSuppressed,
 	)
 	if err != nil {
 		return 0, err
@@ -47,50 +50,50 @@ func (q *Queries) CompletePipelineRun(ctx context.Context, arg CompletePipelineR
 }
 
 const createPipelineRun = `-- name: CreatePipelineRun :one
-INSERT INTO pipeline_runs (
-    id, pull_request_id, head_sha, status,
-    prompt_version, config_hash, metadata
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING created_at, updated_at
+INSERT INTO pipeline_runs (pull_request_id, head_sha, prompt_version, config_hash, metadata)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, pull_request_id, head_sha, prompt_version, config_hash, status, tasks_total, tasks_completed, tasks_failed, findings_total, findings_posted, findings_suppressed, started_at, completed_at, metadata
 `
 
 type CreatePipelineRunParams struct {
-	ID            uuid.UUID       `json:"id"`
 	PullRequestID uuid.UUID       `json:"pull_request_id"`
 	HeadSha       string          `json:"head_sha"`
-	Status        string          `json:"status"`
 	PromptVersion string          `json:"prompt_version"`
 	ConfigHash    string          `json:"config_hash"`
 	Metadata      json.RawMessage `json:"metadata"`
 }
 
-type CreatePipelineRunRow struct {
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-func (q *Queries) CreatePipelineRun(ctx context.Context, arg CreatePipelineRunParams) (CreatePipelineRunRow, error) {
+func (q *Queries) CreatePipelineRun(ctx context.Context, arg CreatePipelineRunParams) (PipelineRun, error) {
 	row := q.db.QueryRow(ctx, createPipelineRun,
-		arg.ID,
 		arg.PullRequestID,
 		arg.HeadSha,
-		arg.Status,
 		arg.PromptVersion,
 		arg.ConfigHash,
 		arg.Metadata,
 	)
-	var i CreatePipelineRunRow
-	err := row.Scan(&i.CreatedAt, &i.UpdatedAt)
+	var i PipelineRun
+	err := row.Scan(
+		&i.ID,
+		&i.PullRequestID,
+		&i.HeadSha,
+		&i.PromptVersion,
+		&i.ConfigHash,
+		&i.Status,
+		&i.TasksTotal,
+		&i.TasksCompleted,
+		&i.TasksFailed,
+		&i.FindingsTotal,
+		&i.FindingsPosted,
+		&i.FindingsSuppressed,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Metadata,
+	)
 	return i, err
 }
 
 const getPipelineRun = `-- name: GetPipelineRun :one
-SELECT id, pull_request_id, head_sha, status,
-       prompt_version, config_hash,
-       task_count, finding_count, error, metadata,
-       started_at, completed_at, created_at, updated_at
-FROM pipeline_runs
-WHERE id = $1
+SELECT id, pull_request_id, head_sha, prompt_version, config_hash, status, tasks_total, tasks_completed, tasks_failed, findings_total, findings_posted, findings_suppressed, started_at, completed_at, metadata FROM pipeline_runs WHERE id = $1
 `
 
 func (q *Queries) GetPipelineRun(ctx context.Context, id uuid.UUID) (PipelineRun, error) {
@@ -100,29 +103,24 @@ func (q *Queries) GetPipelineRun(ctx context.Context, id uuid.UUID) (PipelineRun
 		&i.ID,
 		&i.PullRequestID,
 		&i.HeadSha,
-		&i.Status,
 		&i.PromptVersion,
 		&i.ConfigHash,
-		&i.TaskCount,
-		&i.FindingCount,
-		&i.Error,
-		&i.Metadata,
+		&i.Status,
+		&i.TasksTotal,
+		&i.TasksCompleted,
+		&i.TasksFailed,
+		&i.FindingsTotal,
+		&i.FindingsPosted,
+		&i.FindingsSuppressed,
 		&i.StartedAt,
 		&i.CompletedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
+		&i.Metadata,
 	)
 	return i, err
 }
 
 const listPipelineRunsForPR = `-- name: ListPipelineRunsForPR :many
-SELECT id, pull_request_id, head_sha, status,
-       prompt_version, config_hash,
-       task_count, finding_count, error, metadata,
-       started_at, completed_at, created_at, updated_at
-FROM pipeline_runs
-WHERE pull_request_id = $1
-ORDER BY created_at DESC
+SELECT id, pull_request_id, head_sha, prompt_version, config_hash, status, tasks_total, tasks_completed, tasks_failed, findings_total, findings_posted, findings_suppressed, started_at, completed_at, metadata FROM pipeline_runs WHERE pull_request_id = $1 ORDER BY started_at DESC
 `
 
 func (q *Queries) ListPipelineRunsForPR(ctx context.Context, pullRequestID uuid.UUID) ([]PipelineRun, error) {
@@ -138,17 +136,18 @@ func (q *Queries) ListPipelineRunsForPR(ctx context.Context, pullRequestID uuid.
 			&i.ID,
 			&i.PullRequestID,
 			&i.HeadSha,
-			&i.Status,
 			&i.PromptVersion,
 			&i.ConfigHash,
-			&i.TaskCount,
-			&i.FindingCount,
-			&i.Error,
-			&i.Metadata,
+			&i.Status,
+			&i.TasksTotal,
+			&i.TasksCompleted,
+			&i.TasksFailed,
+			&i.FindingsTotal,
+			&i.FindingsPosted,
+			&i.FindingsSuppressed,
 			&i.StartedAt,
 			&i.CompletedAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
+			&i.Metadata,
 		); err != nil {
 			return nil, err
 		}
@@ -160,18 +159,16 @@ func (q *Queries) ListPipelineRunsForPR(ctx context.Context, pullRequestID uuid.
 	return items, nil
 }
 
-const reconcileStalePipelineRuns = `-- name: ReconcileStalePipelineRuns :execrows
+const reconcileStalePipelineRuns = `-- name: ReconcileStalePipelineRuns :exec
 UPDATE pipeline_runs
-SET status       = 'failed',
-    error        = 'reconciled: process crashed or restarted',
-    completed_at = now()
+SET status = 'failed',
+    completed_at = now(),
+    metadata = metadata || '{"failure_reason": "abandoned: process crash or timeout"}'::jsonb
 WHERE status = 'running'
+  AND started_at < now() - $1::interval
 `
 
-func (q *Queries) ReconcileStalePipelineRuns(ctx context.Context) (int64, error) {
-	result, err := q.db.Exec(ctx, reconcileStalePipelineRuns)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+func (q *Queries) ReconcileStalePipelineRuns(ctx context.Context, dollar_1 pgtype.Interval) error {
+	_, err := q.db.Exec(ctx, reconcileStalePipelineRuns, dollar_1)
+	return err
 }

@@ -1,9 +1,5 @@
 // Package store implements the StoreAdapter interface (pkg/adapter) against
 // PostgreSQL using sqlc-generated query functions and pgx/v5.
-//
-// The Store type is a thin wrapper that translates between core domain types
-// and sqlc's generated pgtype-based structs. All SQL lives in queries/*.sql
-// and is compiled by sqlc into dbsqlc/*.go.
 package store
 
 //go:generate sqlc generate -f ../../sqlc.yaml
@@ -13,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -28,6 +25,7 @@ import (
 type Store struct {
 	pool *pgxpool.Pool
 	q    *dbsqlc.Queries
+	tx   pgx.Tx // non-nil when this Store is transaction-bound
 }
 
 // New creates a Store backed by the given connection pool.
@@ -38,8 +36,7 @@ func New(pool *pgxpool.Pool) *Store {
 	}
 }
 
-// Pool exposes the underlying pool for use by other components (e.g. River)
-// that need a raw pgxpool connection.
+// Pool exposes the underlying pool for components (e.g. River) that need it.
 func (s *Store) Pool() *pgxpool.Pool {
 	return s.pool
 }
@@ -49,7 +46,15 @@ func (s *Store) Pool() *pgxpool.Pool {
 // ---------------------------------------------------------------------------
 
 func (s *Store) WithTx(ctx context.Context, fn adapter.TxFunc) error {
-	tx, err := s.pool.Begin(ctx)
+	// If already transaction-bound, use a savepoint (pgx creates one
+	// automatically when you call Begin on an existing Tx).
+	var tx pgx.Tx
+	var err error
+	if s.tx != nil {
+		tx, err = s.tx.Begin(ctx)
+	} else {
+		tx, err = s.pool.Begin(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("store: begin tx: %w", err)
 	}
@@ -58,6 +63,7 @@ func (s *Store) WithTx(ctx context.Context, fn adapter.TxFunc) error {
 	txStore := &Store{
 		pool: s.pool,
 		q:    s.q.WithTx(tx),
+		tx:   tx,
 	}
 
 	if err := fn(txStore, tx); err != nil {
@@ -72,31 +78,27 @@ func (s *Store) WithTx(ctx context.Context, fn adapter.TxFunc) error {
 // ---------------------------------------------------------------------------
 
 func (s *Store) UpsertPullRequest(ctx context.Context, pr *core.PullRequest) error {
-	if pr.ID == uuid.Nil {
-		pr.ID = uuid.New()
-	}
-
-	metadataJSON, err := json.Marshal(pr.Metadata)
-	if err != nil {
-		return fmt.Errorf("store: marshal PR metadata: %w", err)
+	metadata := pr.Metadata
+	if metadata == nil {
+		metadata = json.RawMessage("{}")
 	}
 
 	row, err := s.q.UpsertPullRequest(ctx, dbsqlc.UpsertPullRequestParams{
-		ID:           pr.ID,
-		ExternalPrID:   pr.ExternalPRID,
+		ExternalPrID: pr.ExternalPRID,
 		RepoFullName: pr.RepoFullName,
 		PrNumber:     int32(pr.PRNumber),
 		HeadSha:      pr.HeadSHA,
 		BaseSha:      pr.BaseSHA,
 		Author:       pr.Author,
 		State:        string(pr.State),
-		Metadata:     metadataJSON,
+		Metadata:     metadata,
 	})
 	if err != nil {
 		return fmt.Errorf("store: upsert pull request: %w", err)
 	}
 
 	pr.ID = row.ID
+	pr.Metadata = row.Metadata
 	pr.CreatedAt = row.CreatedAt
 	pr.UpdatedAt = row.UpdatedAt
 	return nil
@@ -108,25 +110,19 @@ func (s *Store) GetPullRequest(ctx context.Context, id uuid.UUID) (*core.PullReq
 		return nil, fmt.Errorf("store: get pull request %s: %w", id, err)
 	}
 
-	pr := &core.PullRequest{
+	return &core.PullRequest{
 		ID:           row.ID,
-		ExternalPRID:   row.ExternalPrID,
+		ExternalPRID: row.ExternalPrID,
 		RepoFullName: row.RepoFullName,
 		PRNumber:     int(row.PrNumber),
 		HeadSHA:      row.HeadSha,
 		BaseSHA:      row.BaseSha,
 		Author:       row.Author,
 		State:        core.PRState(row.State),
-		DeletedAt:    row.DeletedAt,
+		Metadata:     row.Metadata,
 		CreatedAt:    row.CreatedAt,
 		UpdatedAt:    row.UpdatedAt,
-	}
-
-	if err := json.Unmarshal(row.Metadata, &pr.Metadata); err != nil {
-		return nil, fmt.Errorf("store: unmarshal PR metadata: %w", err)
-	}
-
-	return pr, nil
+	}, nil
 }
 
 func (s *Store) SoftDeletePullRequest(ctx context.Context, id uuid.UUID) error {
@@ -135,7 +131,7 @@ func (s *Store) SoftDeletePullRequest(ctx context.Context, id uuid.UUID) error {
 		return fmt.Errorf("store: soft delete pull request %s: %w", id, err)
 	}
 	if n == 0 {
-		return fmt.Errorf("store: pull request %s not found or already deleted", id)
+		return fmt.Errorf("store: soft delete pull request %s: %w", id, adapter.ErrNotFound)
 	}
 	return nil
 }
@@ -145,49 +141,46 @@ func (s *Store) SoftDeletePullRequest(ctx context.Context, id uuid.UUID) error {
 // ---------------------------------------------------------------------------
 
 func (s *Store) CreatePipelineRun(ctx context.Context, run *core.PipelineRun) error {
-	if run.ID == uuid.Nil {
-		run.ID = uuid.New()
-	}
-	if run.Status == "" {
-		run.Status = core.PipelineRunStatusRunning
+	metadata := run.Metadata
+	if metadata == nil {
+		metadata = json.RawMessage("{}")
 	}
 
-	metadataJSON, err := json.Marshal(run.Metadata)
-	if err != nil {
-		return fmt.Errorf("store: marshal pipeline run metadata: %w", err)
-	}
-
-	result, err := s.q.CreatePipelineRun(ctx, dbsqlc.CreatePipelineRunParams{
-		ID:            run.ID,
+	row, err := s.q.CreatePipelineRun(ctx, dbsqlc.CreatePipelineRunParams{
 		PullRequestID: run.PullRequestID,
 		HeadSha:       run.HeadSHA,
-		Status:        string(run.Status),
 		PromptVersion: run.PromptVersion,
 		ConfigHash:    run.ConfigHash,
-		Metadata:      metadataJSON,
+		Metadata:      metadata,
 	})
 	if err != nil {
 		return fmt.Errorf("store: create pipeline run: %w", err)
 	}
 
-	run.CreatedAt = result.CreatedAt
-	run.UpdatedAt = result.UpdatedAt
+	run.ID = row.ID
+	run.Status = core.PipelineStatus(row.Status)
+	run.StartedAt = row.StartedAt
+	run.CompletedAt = row.CompletedAt
+	run.Metadata = row.Metadata
 	return nil
 }
 
-func (s *Store) CompletePipelineRun(ctx context.Context, id uuid.UUID, status core.PipelineRunStatus, taskCount, findingCount int, errMsg *string) error {
+func (s *Store) CompletePipelineRun(ctx context.Context, id uuid.UUID, status core.PipelineStatus, stats adapter.PipelineRunStats) error {
 	n, err := s.q.CompletePipelineRun(ctx, dbsqlc.CompletePipelineRunParams{
-		ID:           id,
-		Status:       string(status),
-		TaskCount:    int32(taskCount),
-		FindingCount: int32(findingCount),
-		Error:        textFromStringPtr(errMsg),
+		ID:                 id,
+		Status:             string(status),
+		TasksTotal:         int4FromInt(stats.TasksTotal),
+		TasksCompleted:     int4FromInt(stats.TasksCompleted),
+		TasksFailed:        int4FromInt(stats.TasksFailed),
+		FindingsTotal:      int4FromInt(stats.FindingsTotal),
+		FindingsPosted:     int4FromInt(stats.FindingsPosted),
+		FindingsSuppressed: int4FromInt(stats.FindingsSuppressed),
 	})
 	if err != nil {
 		return fmt.Errorf("store: complete pipeline run %s: %w", id, err)
 	}
 	if n == 0 {
-		return fmt.Errorf("store: pipeline run %s not found", id)
+		return fmt.Errorf("store: complete pipeline run %s: %w", id, adapter.ErrNotFound)
 	}
 	return nil
 }
@@ -197,10 +190,7 @@ func (s *Store) GetPipelineRun(ctx context.Context, id uuid.UUID) (*core.Pipelin
 	if err != nil {
 		return nil, fmt.Errorf("store: get pipeline run %s: %w", id, err)
 	}
-	run, err := pipelineRunFromRow(row)
-	if err != nil {
-		return nil, err
-	}
+	run := pipelineRunFromRow(row)
 	return &run, nil
 }
 
@@ -212,21 +202,20 @@ func (s *Store) ListPipelineRunsForPR(ctx context.Context, pullRequestID uuid.UU
 
 	runs := make([]core.PipelineRun, len(rows))
 	for i, row := range rows {
-		run, err := pipelineRunFromRow(row)
-		if err != nil {
-			return nil, fmt.Errorf("store: convert pipeline run row %d: %w", i, err)
-		}
-		runs[i] = run
+		runs[i] = pipelineRunFromRow(row)
 	}
 	return runs, nil
 }
 
-func (s *Store) ReconcileStalePipelineRuns(ctx context.Context) (int64, error) {
-	n, err := s.q.ReconcileStalePipelineRuns(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("store: reconcile stale pipeline runs: %w", err)
+func (s *Store) ReconcileStalePipelineRuns(ctx context.Context, staleThreshold time.Duration) error {
+	interval := pgtype.Interval{
+		Microseconds: staleThreshold.Microseconds(),
+		Valid:        true,
 	}
-	return n, nil
+	if err := s.q.ReconcileStalePipelineRuns(ctx, interval); err != nil {
+		return fmt.Errorf("store: reconcile stale pipeline runs: %w", err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -234,78 +223,68 @@ func (s *Store) ReconcileStalePipelineRuns(ctx context.Context) (int64, error) {
 // ---------------------------------------------------------------------------
 
 func (s *Store) CreateReviewTask(ctx context.Context, task *core.ReviewTask) error {
-	if task.ID == uuid.Nil {
-		task.ID = uuid.New()
-	}
-	if task.Status == "" {
-		task.Status = core.TaskStatusPending
+	var diffHunk pgtype.Text
+	if task.DiffHunk != nil {
+		diffHunk = pgtype.Text{String: *task.DiffHunk, Valid: true}
 	}
 
-	createdAt, err := s.q.CreateReviewTask(ctx, dbsqlc.CreateReviewTaskParams{
-		ID:            task.ID,
+	row, err := s.q.CreateReviewTask(ctx, dbsqlc.CreateReviewTaskParams{
 		PullRequestID: task.PullRequestID,
 		PipelineRunID: task.PipelineRunID,
 		TaskType:      string(task.TaskType),
 		FilePath:      task.FilePath,
-		Symbol:        textFromString(task.Symbol),
+		Symbol:        task.Symbol,
 		RiskScore:     float64(task.RiskScore),
 		ModelID:       task.ModelID,
-		DiffHunk:      textFromString(task.DiffHunk),
-		Status:        string(task.Status),
+		DiffHunk:      diffHunk,
 	})
 	if err != nil {
 		return fmt.Errorf("store: create review task: %w", err)
 	}
 
-	task.CreatedAt = createdAt
+	task.ID = row.ID
+	task.Status = core.TaskStatus(row.Status)
+	task.CreatedAt = row.CreatedAt
 	return nil
 }
 
-func (s *Store) UpdateReviewTaskStatus(ctx context.Context, id uuid.UUID, status core.TaskStatus, errMsg *string) error {
-	var (
-		n   int64
-		err error
-	)
-
-	switch status {
-	case core.TaskStatusRunning:
-		n, err = s.q.UpdateReviewTaskStatusRunning(ctx, dbsqlc.UpdateReviewTaskStatusRunningParams{
-			ID:     id,
-			Status: string(status),
-		})
-	case core.TaskStatusCompleted, core.TaskStatusFailed:
-		n, err = s.q.UpdateReviewTaskStatusTerminal(ctx, dbsqlc.UpdateReviewTaskStatusTerminalParams{
-			ID:     id,
-			Status: string(status),
-			Error:  textFromStringPtr(errMsg),
-		})
-	default:
-		n, err = s.q.UpdateReviewTaskStatusOther(ctx, dbsqlc.UpdateReviewTaskStatusOtherParams{
-			ID:     id,
-			Status: string(status),
-		})
-	}
-
+func (s *Store) UpdateReviewTaskStatus(ctx context.Context, id uuid.UUID, status string, errMsg *string) error {
+	n, err := s.q.UpdateReviewTaskStatus(ctx, dbsqlc.UpdateReviewTaskStatusParams{
+		ID:     id,
+		Status: status,
+		Error:  textFromStringPtr(errMsg),
+	})
 	if err != nil {
 		return fmt.Errorf("store: update review task status %s: %w", id, err)
 	}
 	if n == 0 {
-		return fmt.Errorf("store: review task %s not found", id)
+		return fmt.Errorf("store: update review task status %s: %w", id, adapter.ErrNotFound)
 	}
 	return nil
 }
 
-func (s *Store) ListPendingReviewTasks(ctx context.Context) ([]core.ReviewTask, error) {
-	rows, err := s.q.ListPendingReviewTasks(ctx)
+func (s *Store) ListReviewTasksForPR(ctx context.Context, prID uuid.UUID) ([]core.ReviewTask, error) {
+	rows, err := s.q.ListReviewTasksForPR(ctx, prID)
 	if err != nil {
-		return nil, fmt.Errorf("store: list pending review tasks: %w", err)
+		return nil, fmt.Errorf("store: list review tasks for PR %s: %w", prID, err)
 	}
+	return reviewTasksFromRows(rows), nil
+}
 
-	tasks := make([]core.ReviewTask, len(rows))
-	for i, row := range rows {
-		tasks[i] = reviewTaskFromRow(row)
+func (s *Store) ListReviewTasksForRun(ctx context.Context, runID uuid.UUID) ([]core.ReviewTask, error) {
+	rows, err := s.q.ListReviewTasksForRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list review tasks for run %s: %w", runID, err)
 	}
-	return tasks, nil
+	return reviewTasksFromRows(rows), nil
+}
+
+func (s *Store) CountTaskStats(ctx context.Context, runID uuid.UUID) (total, completed, failed int, err error) {
+	row, err := s.q.CountCompletedAndTotal(ctx, runID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("store: count task stats for run %s: %w", runID, err)
+	}
+	return int(row.Total), int(row.Completed), int(row.Failed), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -313,60 +292,73 @@ func (s *Store) ListPendingReviewTasks(ctx context.Context) ([]core.ReviewTask, 
 // ---------------------------------------------------------------------------
 
 func (s *Store) CreateFinding(ctx context.Context, f *core.Finding) error {
-	if f.ID == uuid.Nil {
-		f.ID = uuid.New()
+	metadata := f.Metadata
+	if metadata == nil {
+		metadata = json.RawMessage("{}")
 	}
 
-	metadataJSON, err := json.Marshal(f.Metadata)
-	if err != nil {
-		return fmt.Errorf("store: marshal finding metadata: %w", err)
-	}
+	return s.WithTx(ctx, func(txStore adapter.StoreAdapter, _ pgx.Tx) error {
+		st := txStore.(*Store)
+		row, err := st.q.CreateFinding(ctx, dbsqlc.CreateFindingParams{
+			ReviewTaskID:      f.ReviewTaskID,
+			PullRequestID:     f.PullRequestID,
+			PipelineRunID:     f.PipelineRunID,
+			RepoFullName:      f.RepoFullName,
+			FilePath:          f.FilePath,
+			StartLine:         int4FromIntPtr(f.StartLine),
+			EndLine:           int4FromIntPtr(f.EndLine),
+			Symbol:            f.Symbol,
+			Category:          string(f.Category),
+			ConfidenceTier:    string(f.ConfidenceTier),
+			ConfidenceScore:   f.ConfidenceScore,
+			Severity:          string(f.Severity),
+			Title:             f.Title,
+			Body:              f.Body,
+			Suggestion:        textFromString(f.Suggestion),
+			LocationHash:      f.LocationHash,
+			ContentHash:       textFromStringPtr(f.ContentHash),
+			HeadSha:           f.HeadSHA,
+			SuppressionReason: textFromStringPtr(f.SuppressionReason),
+			ModelID:           f.ModelID,
+			PromptTokens:      int4FromIntPtr(f.PromptTokens),
+			CompletionTokens:  int4FromIntPtr(f.CompletionTokens),
+			Metadata:          metadata,
+		})
+		if err != nil {
+			return fmt.Errorf("store: create finding: %w", err)
+		}
 
-	result, err := s.q.CreateFinding(ctx, dbsqlc.CreateFindingParams{
-		ID:               f.ID,
-		ReviewTaskID:     f.ReviewTaskID,
-		PullRequestID:    f.PullRequestID,
-		PipelineRunID:    f.PipelineRunID,
-		FilePath:         f.FilePath,
-		StartLine:        int4FromIntPtr(f.StartLine),
-		EndLine:          int4FromIntPtr(f.EndLine),
-		Symbol:           textFromString(f.Symbol),
-		Category:         string(f.Category),
-		ConfidenceTier:   string(f.ConfidenceTier),
-		ConfidenceScore:  f.ConfidenceScore,
-		Severity:         string(f.Severity),
-		Title:            f.Title,
-		Body:             f.Body,
-		Suggestion:       textFromString(f.Suggestion),
-		LocationHash:     f.LocationHash,
-		ContentHash:      textFromString(f.ContentHash),
-		HeadSha:          f.HeadSHA,
-		ModelID:          f.ModelID,
-		PromptTokens:     int4FromIntPtr(f.PromptTokens),
-		CompletionTokens: int4FromIntPtr(f.CompletionTokens),
-		Metadata:         metadataJSON,
+		f.ID = row.ID
+		f.CreatedAt = row.CreatedAt
+		f.UpdatedAt = row.UpdatedAt
+
+		if err := txStore.CreateFindingEvent(ctx, f.ID, "created", "system", nil, nil); err != nil {
+			return fmt.Errorf("store: create finding %s: event: %w", f.ID, err)
+		}
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("store: create finding: %w", err)
-	}
-
-	f.CreatedAt = result.CreatedAt
-	f.UpdatedAt = result.UpdatedAt
-	return nil
 }
 
-func (s *Store) ListFindingsForPR(ctx context.Context, pullRequestID uuid.UUID) ([]core.Finding, error) {
-	rows, err := s.q.ListFindingsForPR(ctx, pullRequestID)
+func (s *Store) ListFindingsForPR(ctx context.Context, prID uuid.UUID) ([]core.Finding, error) {
+	rows, err := s.q.ListFindingsForPR(ctx, prID)
 	if err != nil {
-		return nil, fmt.Errorf("store: list findings for PR %s: %w", pullRequestID, err)
+		return nil, fmt.Errorf("store: list findings for PR %s: %w", prID, err)
 	}
-	return findingsFromRows(rows)
+	return findingsFromRows(rows), nil
 }
 
-func (s *Store) FindPriorFinding(ctx context.Context, locationHash, repoFullName string) (*core.Finding, error) {
+func (s *Store) ListFindingsForRun(ctx context.Context, runID uuid.UUID) ([]core.Finding, error) {
+	rows, err := s.q.ListFindingsForRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list findings for run %s: %w", runID, err)
+	}
+	return findingsFromRows(rows), nil
+}
+
+func (s *Store) FindPriorFinding(ctx context.Context, prID uuid.UUID, locationHash string) (*core.Finding, error) {
 	row, err := s.q.FindPriorFinding(ctx, dbsqlc.FindPriorFindingParams{
+		ID:           prID,
 		LocationHash: locationHash,
-		RepoFullName: repoFullName,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -374,61 +366,78 @@ func (s *Store) FindPriorFinding(ctx context.Context, locationHash, repoFullName
 		}
 		return nil, fmt.Errorf("store: find prior finding: %w", err)
 	}
-	f, err := findingFromRow(row)
-	if err != nil {
-		return nil, err
-	}
-	return &f, nil
+	return &core.Finding{
+		ID:           row.ID,
+		LocationHash: row.LocationHash,
+		ContentHash:  stringPtrFromText(row.ContentHash),
+		HeadSHA:      row.HeadSha,
+	}, nil
 }
 
-func (s *Store) ListUnaddressedFindings(ctx context.Context, pullRequestID uuid.UUID) ([]core.Finding, error) {
-	rows, err := s.q.ListUnaddressedFindings(ctx, pullRequestID)
+func (s *Store) ListUnaddressedFindings(ctx context.Context, prID uuid.UUID) ([]core.Finding, error) {
+	rows, err := s.q.ListUnaddressedFindingsForPR(ctx, prID)
 	if err != nil {
-		return nil, fmt.Errorf("store: list unaddressed findings for PR %s: %w", pullRequestID, err)
+		return nil, fmt.Errorf("store: list unaddressed findings for PR %s: %w", prID, err)
 	}
-	return findingsFromRows(rows)
+	return findingsFromRows(rows), nil
 }
 
-func (s *Store) ListUnpostedFindings(ctx context.Context, pullRequestID uuid.UUID) ([]core.Finding, error) {
-	rows, err := s.q.ListUnpostedFindings(ctx, pullRequestID)
+func (s *Store) ListUnpostedFindings(ctx context.Context, pipelineRunID uuid.UUID) ([]core.Finding, error) {
+	rows, err := s.q.ListUnpostedFindings(ctx, pipelineRunID)
 	if err != nil {
-		return nil, fmt.Errorf("store: list unposted findings for PR %s: %w", pullRequestID, err)
+		return nil, fmt.Errorf("store: list unposted findings for run %s: %w", pipelineRunID, err)
 	}
-	return findingsFromRows(rows)
+	return findingsFromRows(rows), nil
 }
 
 func (s *Store) MarkFindingPosted(ctx context.Context, id uuid.UUID, commentID int64) error {
-	n, err := s.q.MarkFindingPosted(ctx, dbsqlc.MarkFindingPostedParams{
-		ID:              id,
-		ExternalCommentID: pgtype.Int8{Int64: commentID, Valid: true},
+	return s.WithTx(ctx, func(txStore adapter.StoreAdapter, _ pgx.Tx) error {
+		if err := txStore.CreateFindingEvent(ctx, id, "posted", "system", nil, nil); err != nil {
+			return fmt.Errorf("store: mark finding posted %s: event: %w", id, err)
+		}
+		st := txStore.(*Store)
+		n, err := st.q.MarkFindingPosted(ctx, dbsqlc.MarkFindingPostedParams{
+			ID:                id,
+			ExternalCommentID: pgtype.Int8{Int64: commentID, Valid: true},
+		})
+		if err != nil {
+			return fmt.Errorf("store: mark finding posted %s: %w", id, err)
+		}
+		if n == 0 {
+			return fmt.Errorf("store: mark finding posted %s: %w", id, adapter.ErrNotFound)
+		}
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("store: mark finding posted %s: %w", id, err)
-	}
-	if n == 0 {
-		return fmt.Errorf("store: finding %s not found", id)
-	}
-	return nil
 }
 
-func (s *Store) MarkFindingAddressed(ctx context.Context, id uuid.UUID) error {
-	n, err := s.q.MarkFindingAddressed(ctx, id)
-	if err != nil {
-		return fmt.Errorf("store: mark finding addressed %s: %w", id, err)
-	}
-	if n == 0 {
-		return fmt.Errorf("store: finding %s not found", id)
-	}
-	return nil
+func (s *Store) MarkFindingAddressed(ctx context.Context, id uuid.UUID, status core.AddressedStatus) error {
+	newVal := string(status)
+	return s.WithTx(ctx, func(txStore adapter.StoreAdapter, _ pgx.Tx) error {
+		if err := txStore.CreateFindingEvent(ctx, id, "addressed", "system", nil, &newVal); err != nil {
+			return fmt.Errorf("store: mark finding addressed %s: event: %w", id, err)
+		}
+		st := txStore.(*Store)
+		n, err := st.q.MarkFindingAddressed(ctx, dbsqlc.MarkFindingAddressedParams{
+			ID:              id,
+			AddressedStatus: newVal,
+		})
+		if err != nil {
+			return fmt.Errorf("store: mark finding addressed %s: %w", id, err)
+		}
+		if n == 0 {
+			return fmt.Errorf("store: mark finding addressed %s: %w", id, adapter.ErrNotFound)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
 // Dismissed Fingerprints
 // ---------------------------------------------------------------------------
 
-func (s *Store) IsFingerprintDismissed(ctx context.Context, locationHash, repoFullName string) (bool, error) {
+func (s *Store) IsFingerprintDismissed(ctx context.Context, fingerprint, repoFullName string) (bool, error) {
 	dismissed, err := s.q.IsFingerprintDismissed(ctx, dbsqlc.IsFingerprintDismissedParams{
-		Fingerprint:  locationHash,
+		Fingerprint:  fingerprint,
 		RepoFullName: repoFullName,
 	})
 	if err != nil {
@@ -438,42 +447,32 @@ func (s *Store) IsFingerprintDismissed(ctx context.Context, locationHash, repoFu
 }
 
 func (s *Store) DismissFingerprint(ctx context.Context, fingerprint, repoFullName, dismissedBy, reason string) error {
-	return s.q.DismissFingerprint(ctx, dbsqlc.DismissFingerprintParams{
+	if err := s.q.DismissFingerprint(ctx, dbsqlc.DismissFingerprintParams{
 		Fingerprint:  fingerprint,
 		RepoFullName: repoFullName,
 		DismissedBy:  dismissedBy,
 		Reason:       textFromString(reason),
-	})
+	}); err != nil {
+		return fmt.Errorf("store: dismiss fingerprint %s/%s: %w", repoFullName, fingerprint, err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
 // Finding Events
 // ---------------------------------------------------------------------------
 
-func (s *Store) CreateFindingEvent(ctx context.Context, event *core.FindingEvent) error {
-	if event.ID == uuid.Nil {
-		event.ID = uuid.New()
+func (s *Store) CreateFindingEvent(ctx context.Context, findingID uuid.UUID, eventType, actor string, oldValue, newValue *string) error {
+	if err := s.q.CreateFindingEvent(ctx, dbsqlc.CreateFindingEventParams{
+		FindingID: findingID,
+		EventType: eventType,
+		Actor:     actor,
+		OldValue:  textFromStringPtr(oldValue),
+		NewValue:  textFromStringPtr(newValue),
+		Metadata:  json.RawMessage("{}"),
+	}); err != nil {
+		return fmt.Errorf("store: create finding event for %s: %w", findingID, err)
 	}
-
-	metadataJSON, err := json.Marshal(event.Metadata)
-	if err != nil {
-		return fmt.Errorf("store: marshal finding event metadata: %w", err)
-	}
-
-	createdAt, err := s.q.CreateFindingEvent(ctx, dbsqlc.CreateFindingEventParams{
-		ID:        event.ID,
-		FindingID: event.FindingID,
-		EventType: event.EventType,
-		Actor:     event.Actor,
-		OldValue:  textFromString(event.OldValue),
-		NewValue:  textFromString(event.NewValue),
-		Metadata:  metadataJSON,
-	})
-	if err != nil {
-		return fmt.Errorf("store: create finding event: %w", err)
-	}
-
-	event.CreatedAt = createdAt
 	return nil
 }
 
@@ -485,17 +484,13 @@ func (s *Store) ListEventsForFinding(ctx context.Context, findingID uuid.UUID) (
 
 	events := make([]core.FindingEvent, len(rows))
 	for i, row := range rows {
-		event, err := findingEventFromRow(row)
-		if err != nil {
-			return nil, fmt.Errorf("store: convert finding event row %d: %w", i, err)
-		}
-		events[i] = event
+		events[i] = findingEventFromRow(row)
 	}
 	return events, nil
 }
 
 // ---------------------------------------------------------------------------
-// pgtype ↔ core conversion helpers
+// pgtype <-> core conversion helpers
 // ---------------------------------------------------------------------------
 
 func textFromString(s string) pgtype.Text {
@@ -533,6 +528,10 @@ func int4FromIntPtr(p *int) pgtype.Int4 {
 	return pgtype.Int4{Int32: int32(*p), Valid: true}
 }
 
+func int4FromInt(v int) pgtype.Int4 {
+	return pgtype.Int4{Int32: int32(v), Valid: true}
+}
+
 func intPtrFromInt4(i pgtype.Int4) *int {
 	if !i.Valid {
 		return nil
@@ -548,7 +547,6 @@ func int64PtrFromInt8(i pgtype.Int8) *int64 {
 	return &i.Int64
 }
 
-// reviewTaskFromRow converts a sqlc-generated ReviewTask to a core.ReviewTask.
 func reviewTaskFromRow(row dbsqlc.ReviewTask) core.ReviewTask {
 	return core.ReviewTask{
 		ID:            row.ID,
@@ -556,10 +554,10 @@ func reviewTaskFromRow(row dbsqlc.ReviewTask) core.ReviewTask {
 		PipelineRunID: row.PipelineRunID,
 		TaskType:      core.TaskType(row.TaskType),
 		FilePath:      row.FilePath,
-		Symbol:        stringFromText(row.Symbol),
+		Symbol:        row.Symbol,
 		RiskScore:     core.RiskScore(row.RiskScore),
 		ModelID:       row.ModelID,
-		DiffHunk:      stringFromText(row.DiffHunk),
+		DiffHunk:      stringPtrFromText(row.DiffHunk),
 		Status:        core.TaskStatus(row.Status),
 		Error:         stringPtrFromText(row.Error),
 		StartedAt:     row.StartedAt,
@@ -568,106 +566,87 @@ func reviewTaskFromRow(row dbsqlc.ReviewTask) core.ReviewTask {
 	}
 }
 
-// findingFromRow converts a sqlc-generated Finding to a core.Finding.
-func findingFromRow(row dbsqlc.Finding) (core.Finding, error) {
-	f := core.Finding{
-		ID:                    row.ID,
-		ReviewTaskID:          row.ReviewTaskID,
-		PullRequestID:         row.PullRequestID,
-		PipelineRunID:         row.PipelineRunID,
-		FilePath:              row.FilePath,
-		StartLine:             intPtrFromInt4(row.StartLine),
-		EndLine:               intPtrFromInt4(row.EndLine),
-		Symbol:                stringFromText(row.Symbol),
-		Category:              core.Category(row.Category),
-		ConfidenceTier:        core.ConfidenceTier(row.ConfidenceTier),
-		ConfidenceScore:       row.ConfidenceScore,
-		Severity:              core.Severity(row.Severity),
-		Title:                 row.Title,
-		Body:                  row.Body,
-		Suggestion:            stringFromText(row.Suggestion),
-		LocationHash:          row.LocationHash,
-		ContentHash:           stringFromText(row.ContentHash),
-		HeadSHA:               row.HeadSha,
-		PostedAt:              row.PostedAt,
-		ExternalCommentID:       int64PtrFromInt8(row.ExternalCommentID),
-		AddressedInNextCommit: row.AddressedInNextCommit,
-		SuppressionReason:     stringFromText(row.SuppressionReason),
-		DismissedAt:           row.DismissedAt,
-		DismissedBy:           stringFromText(row.DismissedBy),
-		ModelID:               row.ModelID,
-		PromptTokens:          intPtrFromInt4(row.PromptTokens),
-		CompletionTokens:      intPtrFromInt4(row.CompletionTokens),
-		CreatedAt:             row.CreatedAt,
-		UpdatedAt:             row.UpdatedAt,
+func reviewTasksFromRows(rows []dbsqlc.ReviewTask) []core.ReviewTask {
+	tasks := make([]core.ReviewTask, len(rows))
+	for i, row := range rows {
+		tasks[i] = reviewTaskFromRow(row)
 	}
-
-	if row.Metadata != nil {
-		if err := json.Unmarshal(row.Metadata, &f.Metadata); err != nil {
-			return core.Finding{}, fmt.Errorf("unmarshal finding metadata: %w", err)
-		}
-	}
-
-	return f, nil
+	return tasks
 }
 
-// findingsFromRows converts a slice of sqlc Finding rows to core.Finding slice.
-func findingsFromRows(rows []dbsqlc.Finding) ([]core.Finding, error) {
+func findingFromRow(row dbsqlc.Finding) core.Finding {
+	return core.Finding{
+		ID:                row.ID,
+		ReviewTaskID:      row.ReviewTaskID,
+		PullRequestID:     row.PullRequestID,
+		PipelineRunID:     row.PipelineRunID,
+		RepoFullName:      row.RepoFullName,
+		FilePath:          row.FilePath,
+		StartLine:         intPtrFromInt4(row.StartLine),
+		EndLine:           intPtrFromInt4(row.EndLine),
+		Symbol:            row.Symbol,
+		Category:          core.FindingCategory(row.Category),
+		ConfidenceTier:    core.ConfidenceTier(row.ConfidenceTier),
+		ConfidenceScore:   row.ConfidenceScore,
+		Severity:          core.Severity(row.Severity),
+		Title:             row.Title,
+		Body:              row.Body,
+		Suggestion:        stringFromText(row.Suggestion),
+		LocationHash:      row.LocationHash,
+		ContentHash:       stringPtrFromText(row.ContentHash),
+		HeadSHA:           row.HeadSha,
+		PostedAt:          row.PostedAt,
+		ExternalCommentID: int64PtrFromInt8(row.ExternalCommentID),
+		AddressedStatus:   core.AddressedStatus(row.AddressedStatus),
+		SuppressionReason: stringPtrFromText(row.SuppressionReason),
+		DismissedAt:       row.DismissedAt,
+		DismissedBy:       stringPtrFromText(row.DismissedBy),
+		ModelID:           row.ModelID,
+		PromptTokens:      intPtrFromInt4(row.PromptTokens),
+		CompletionTokens:  intPtrFromInt4(row.CompletionTokens),
+		Metadata:          row.Metadata,
+		CreatedAt:         row.CreatedAt,
+		UpdatedAt:         row.UpdatedAt,
+	}
+}
+
+func findingsFromRows(rows []dbsqlc.Finding) []core.Finding {
 	findings := make([]core.Finding, len(rows))
 	for i, row := range rows {
-		f, err := findingFromRow(row)
-		if err != nil {
-			return nil, fmt.Errorf("store: convert finding row %d: %w", i, err)
-		}
-		findings[i] = f
+		findings[i] = findingFromRow(row)
 	}
-	return findings, nil
+	return findings
 }
 
-// pipelineRunFromRow converts a sqlc-generated PipelineRun to a core.PipelineRun.
-func pipelineRunFromRow(row dbsqlc.PipelineRun) (core.PipelineRun, error) {
-	run := core.PipelineRun{
-		ID:            row.ID,
-		PullRequestID: row.PullRequestID,
-		HeadSHA:       row.HeadSha,
-		Status:        core.PipelineRunStatus(row.Status),
-		PromptVersion: row.PromptVersion,
-		ConfigHash:    row.ConfigHash,
-		TaskCount:     int(row.TaskCount),
-		FindingCount:  int(row.FindingCount),
-		Error:         stringPtrFromText(row.Error),
-		StartedAt:     row.StartedAt,
-		CompletedAt:   row.CompletedAt,
-		CreatedAt:     row.CreatedAt,
-		UpdatedAt:     row.UpdatedAt,
+func pipelineRunFromRow(row dbsqlc.PipelineRun) core.PipelineRun {
+	return core.PipelineRun{
+		ID:                 row.ID,
+		PullRequestID:      row.PullRequestID,
+		HeadSHA:            row.HeadSha,
+		PromptVersion:      row.PromptVersion,
+		ConfigHash:         row.ConfigHash,
+		Status:             core.PipelineStatus(row.Status),
+		TasksTotal:         intPtrFromInt4(row.TasksTotal),
+		TasksCompleted:     intPtrFromInt4(row.TasksCompleted),
+		TasksFailed:        intPtrFromInt4(row.TasksFailed),
+		FindingsTotal:      intPtrFromInt4(row.FindingsTotal),
+		FindingsPosted:     intPtrFromInt4(row.FindingsPosted),
+		FindingsSuppressed: intPtrFromInt4(row.FindingsSuppressed),
+		StartedAt:          row.StartedAt,
+		CompletedAt:        row.CompletedAt,
+		Metadata:           row.Metadata,
 	}
-
-	if row.Metadata != nil {
-		if err := json.Unmarshal(row.Metadata, &run.Metadata); err != nil {
-			return core.PipelineRun{}, fmt.Errorf("unmarshal pipeline run metadata: %w", err)
-		}
-	}
-
-	return run, nil
 }
 
-// findingEventFromRow converts a sqlc-generated FindingEvent to a core.FindingEvent.
-func findingEventFromRow(row dbsqlc.FindingEvent) (core.FindingEvent, error) {
-	event := core.FindingEvent{
+func findingEventFromRow(row dbsqlc.FindingEvent) core.FindingEvent {
+	return core.FindingEvent{
 		ID:        row.ID,
 		FindingID: row.FindingID,
 		EventType: row.EventType,
 		Actor:     row.Actor,
-		OldValue:  stringFromText(row.OldValue),
-		NewValue:  stringFromText(row.NewValue),
+		OldValue:  stringPtrFromText(row.OldValue),
+		NewValue:  stringPtrFromText(row.NewValue),
+		Metadata:  row.Metadata,
 		CreatedAt: row.CreatedAt,
 	}
-
-	if row.Metadata != nil {
-		if err := json.Unmarshal(row.Metadata, &event.Metadata); err != nil {
-			return core.FindingEvent{}, fmt.Errorf("unmarshal finding event metadata: %w", err)
-		}
-	}
-
-	return event, nil
 }

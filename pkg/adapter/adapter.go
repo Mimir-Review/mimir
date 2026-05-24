@@ -2,12 +2,18 @@ package adapter
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ashita-ai/mimir/internal/core"
 )
+
+// ErrNotFound is returned when a mutating operation targets a row that does
+// not exist (or, for soft-deletable entities, has already been deleted).
+var ErrNotFound = errors.New("not found")
 
 // ---------------------------------------------------------------------------
 // ProviderAdapter — code hosting platform (GitHub M1, GitLab M2+)
@@ -36,7 +42,7 @@ type PostCommentRequest struct {
 	PRNumber     int    `json:"pr_number"`
 	CommitSHA    string `json:"commit_sha"`
 	FilePath     string `json:"file_path"`
-	Line         int    `json:"line"` // diff line number (GitHub convention)
+	Line         int    `json:"line"`
 	Body         string `json:"body"`
 }
 
@@ -47,7 +53,6 @@ type PostCommentRequest struct {
 // ModelAdapter sends a review task + context slice to a model and returns findings.
 type ModelAdapter interface {
 	// Infer runs model inference for a single review task.
-	// The slice contains the token-budgeted context (diff, call graph, tests).
 	Infer(ctx context.Context, task core.ReviewTask, slice core.Slice) ([]core.Finding, error)
 
 	// ModelID returns the identifier string (e.g. "claude-opus-4-6").
@@ -64,7 +69,6 @@ type ModelAdapter interface {
 // StaticToolAdapter runs a static analysis tool over changed files.
 type StaticToolAdapter interface {
 	// Run executes the tool and returns findings.
-	// files is the subset of PR-changed files relevant to this task.
 	Run(ctx context.Context, task core.ReviewTask, files []string) ([]core.Finding, error)
 
 	// ToolName returns the tool identifier (e.g. "semgrep", "golangci-lint").
@@ -80,17 +84,13 @@ type StaticToolAdapter interface {
 
 // IndexAdapter builds and queries the semantic repo map for a review run.
 type IndexAdapter interface {
-	// BuildSymbolTable runs the change cone algorithm (ADR-0004): parses changed
-	// files, finds importers, extracts references, and builds the per-run symbol table.
-	// Called once per pipeline run; the returned SymbolTable is passed to Query calls.
+	// BuildSymbolTable runs the change cone algorithm (ADR-0004).
 	BuildSymbolTable(ctx context.Context, repoPath, baseSHA, headSHA string) (*core.SymbolTable, error)
 
-	// Query returns context slices for a review task, respecting the token budget.
-	Query(ctx context.Context, req IndexRequest) ([]core.Slice, error)
+	// Query returns context content for a review task within the token budget.
+	Query(ctx context.Context, req IndexRequest) (*IndexResult, error)
 
 	// IsApproximate returns true if the index is heuristic (not type-resolved).
-	// When true, downstream consumers apply a confidence penalty and annotate
-	// prompts with an approximation warning (see ADR-0004).
 	IsApproximate() bool
 }
 
@@ -102,21 +102,23 @@ type IndexRequest struct {
 	Budget      core.TokenBudget `json:"budget"`
 }
 
+// IndexResult holds the context content returned by IndexAdapter.Query.
+type IndexResult struct {
+	DiffHunk    string `json:"diff_hunk"`
+	CallGraph   string `json:"call_graph"`
+	TestContext string `json:"test_context"`
+}
+
 // ---------------------------------------------------------------------------
 // PolicyAdapter — finding gating, triage, and escalation
 // ---------------------------------------------------------------------------
 
 // PolicyAdapter gates findings before they are posted to the code host.
-// See ADR-0005 for the two-tier posting strategy.
 type PolicyAdapter interface {
-	// Triage partitions findings into posting tiers: inline (diff comments),
-	// summary (table in the summary comment), suppress (not posted).
-	// Enforces escalation rules and dedup. All high-confidence findings are posted inline.
+	// Triage partitions findings into posting tiers.
 	Triage(ctx context.Context, findings []core.Finding) (inline, summary, suppress []core.Finding)
 
-	// ShouldEscalate returns true if the finding should bypass normal
-	// suppression rules (e.g. low-confidence but security/critical).
-	// Used by Triage internally; exposed for testing and simple policy implementations.
+	// ShouldEscalate returns true if the finding bypasses normal posting rules.
 	ShouldEscalate(ctx context.Context, f core.Finding) bool
 }
 
@@ -128,105 +130,62 @@ type PolicyAdapter interface {
 // the raw pgx.Tx for components (e.g. River) that need direct tx access.
 type TxFunc func(txStore StoreAdapter, tx pgx.Tx) error
 
+// PipelineRunStats is passed to CompletePipelineRun to record final counts.
+type PipelineRunStats struct {
+	TasksTotal         int
+	TasksCompleted     int
+	TasksFailed        int
+	FindingsTotal      int
+	FindingsPosted     int
+	FindingsSuppressed int
+}
+
 // StoreAdapter is the persistence boundary for all domain objects.
 type StoreAdapter interface {
 	// --- Transactions ---
 
-	// WithTx runs fn inside a database transaction. The txStore argument
-	// passed to fn is bound to the transaction. If fn returns an error,
-	// the transaction is rolled back; otherwise it is committed.
-	// The raw pgx.Tx is exposed for components like River that need it.
 	WithTx(ctx context.Context, fn TxFunc) error
 
 	// --- Pull Requests ---
 
-	// UpsertPullRequest creates or updates a PR record. Upsert key is
-	// (external_pr_id, head_sha).
 	UpsertPullRequest(ctx context.Context, pr *core.PullRequest) error
-
-	// GetPullRequest retrieves a PR by its internal UUID.
 	GetPullRequest(ctx context.Context, id uuid.UUID) (*core.PullRequest, error)
-
-	// SoftDeletePullRequest sets deleted_at on a PR record.
 	SoftDeletePullRequest(ctx context.Context, id uuid.UUID) error
 
 	// --- Pipeline Runs ---
 
-	// CreatePipelineRun inserts a new pipeline run record.
 	CreatePipelineRun(ctx context.Context, run *core.PipelineRun) error
-
-	// CompletePipelineRun marks a pipeline run as completed or failed,
-	// recording final task/finding counts and optional error.
-	CompletePipelineRun(ctx context.Context, id uuid.UUID, status core.PipelineRunStatus, taskCount, findingCount int, errMsg *string) error
-
-	// GetPipelineRun retrieves a pipeline run by its internal UUID.
+	CompletePipelineRun(ctx context.Context, id uuid.UUID, status core.PipelineStatus, stats PipelineRunStats) error
 	GetPipelineRun(ctx context.Context, id uuid.UUID) (*core.PipelineRun, error)
-
-	// ListPipelineRunsForPR returns all pipeline runs for a given pull request.
-	ListPipelineRunsForPR(ctx context.Context, pullRequestID uuid.UUID) ([]core.PipelineRun, error)
-
-	// ReconcileStalePipelineRuns marks any runs still in 'running' status
-	// as 'failed'. Called at startup to clean up after crashes.
-	ReconcileStalePipelineRuns(ctx context.Context) (int64, error)
+	ListPipelineRunsForPR(ctx context.Context, prID uuid.UUID) ([]core.PipelineRun, error)
+	ReconcileStalePipelineRuns(ctx context.Context, staleThreshold time.Duration) error
 
 	// --- Review Tasks ---
 
-	// CreateReviewTask inserts a new review task.
 	CreateReviewTask(ctx context.Context, task *core.ReviewTask) error
-
-	// UpdateReviewTaskStatus transitions a task's status and optionally
-	// records an error message (for failed tasks).
-	UpdateReviewTaskStatus(ctx context.Context, id uuid.UUID, status core.TaskStatus, errMsg *string) error
-
-	// ListPendingReviewTasks returns tasks with status = 'pending',
-	// ordered by risk_score descending.
-	ListPendingReviewTasks(ctx context.Context) ([]core.ReviewTask, error)
+	UpdateReviewTaskStatus(ctx context.Context, id uuid.UUID, status string, errMsg *string) error
+	ListReviewTasksForPR(ctx context.Context, prID uuid.UUID) ([]core.ReviewTask, error)
+	ListReviewTasksForRun(ctx context.Context, runID uuid.UUID) ([]core.ReviewTask, error)
+	CountTaskStats(ctx context.Context, runID uuid.UUID) (total, completed, failed int, err error)
 
 	// --- Findings ---
 
-	// CreateFinding inserts a new finding. Every finding is preserved
-	// (no upsert — append-only by design).
 	CreateFinding(ctx context.Context, f *core.Finding) error
-
-	// ListFindingsForPR returns all findings for a given pull request,
-	// ordered by confidence descending, severity priority ascending.
-	ListFindingsForPR(ctx context.Context, pullRequestID uuid.UUID) ([]core.Finding, error)
-
-	// FindPriorFinding looks up a previous finding with the same location hash
-	// for the given repo. Used by policy for cross-run dedup.
-	FindPriorFinding(ctx context.Context, locationHash, repoFullName string) (*core.Finding, error)
-
-	// ListUnaddressedFindings returns posted findings that have not been
-	// addressed in a subsequent commit. Used by addressed-in-next-commit detection.
-	ListUnaddressedFindings(ctx context.Context, pullRequestID uuid.UUID) ([]core.Finding, error)
-
-	// ListUnpostedFindings returns findings that should have been posted
-	// but lack a posted_at timestamp. Used by the posting retry job.
-	ListUnpostedFindings(ctx context.Context, pullRequestID uuid.UUID) ([]core.Finding, error)
-
-	// MarkFindingPosted records the platform comment ID and timestamp
-	// after a finding is posted as a review comment.
+	ListFindingsForPR(ctx context.Context, prID uuid.UUID) ([]core.Finding, error)
+	ListFindingsForRun(ctx context.Context, runID uuid.UUID) ([]core.Finding, error)
 	MarkFindingPosted(ctx context.Context, id uuid.UUID, commentID int64) error
-
-	// MarkFindingAddressed sets addressed_in_next_commit = true.
-	MarkFindingAddressed(ctx context.Context, id uuid.UUID) error
+	MarkFindingAddressed(ctx context.Context, id uuid.UUID, status core.AddressedStatus) error
+	FindPriorFinding(ctx context.Context, prID uuid.UUID, locationHash string) (*core.Finding, error)
+	ListUnaddressedFindings(ctx context.Context, prID uuid.UUID) ([]core.Finding, error)
+	ListUnpostedFindings(ctx context.Context, pipelineRunID uuid.UUID) ([]core.Finding, error)
 
 	// --- Dismissed Fingerprints ---
 
-	// IsFingerprintDismissed checks whether a location hash has been
-	// permanently dismissed for the given repository.
-	IsFingerprintDismissed(ctx context.Context, locationHash, repoFullName string) (bool, error)
-
-	// DismissFingerprint records a permanent dismissal for a location hash
-	// in the given repository. Upserts to avoid duplicate key errors.
+	IsFingerprintDismissed(ctx context.Context, fingerprint, repoFullName string) (bool, error)
 	DismissFingerprint(ctx context.Context, fingerprint, repoFullName, dismissedBy, reason string) error
 
 	// --- Finding Events ---
 
-	// CreateFindingEvent inserts an append-only lifecycle event for a finding.
-	CreateFindingEvent(ctx context.Context, event *core.FindingEvent) error
-
-	// ListEventsForFinding returns all lifecycle events for a given finding,
-	// ordered by created_at ascending.
+	CreateFindingEvent(ctx context.Context, findingID uuid.UUID, eventType, actor string, oldValue, newValue *string) error
 	ListEventsForFinding(ctx context.Context, findingID uuid.UUID) ([]core.FindingEvent, error)
 }

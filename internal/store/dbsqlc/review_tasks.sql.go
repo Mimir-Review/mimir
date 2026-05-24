@@ -7,36 +7,52 @@ package dbsqlc
 
 import (
 	"context"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countCompletedAndTotal = `-- name: CountCompletedAndTotal :one
+SELECT
+    COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+    COUNT(*) FILTER (WHERE status = 'failed') AS failed
+FROM review_tasks
+WHERE pipeline_run_id = $1
+`
+
+type CountCompletedAndTotalRow struct {
+	Total     int64 `json:"total"`
+	Completed int64 `json:"completed"`
+	Failed    int64 `json:"failed"`
+}
+
+func (q *Queries) CountCompletedAndTotal(ctx context.Context, pipelineRunID uuid.UUID) (CountCompletedAndTotalRow, error) {
+	row := q.db.QueryRow(ctx, countCompletedAndTotal, pipelineRunID)
+	var i CountCompletedAndTotalRow
+	err := row.Scan(&i.Total, &i.Completed, &i.Failed)
+	return i, err
+}
+
 const createReviewTask = `-- name: CreateReviewTask :one
-INSERT INTO review_tasks (
-    id, pull_request_id, pipeline_run_id, task_type,
-    file_path, symbol, risk_score, model_id, diff_hunk, status
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING created_at
+INSERT INTO review_tasks (pull_request_id, pipeline_run_id, task_type, file_path, symbol, risk_score, model_id, diff_hunk)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, pull_request_id, pipeline_run_id, task_type, file_path, symbol, risk_score, model_id, diff_hunk, status, error, started_at, completed_at, created_at
 `
 
 type CreateReviewTaskParams struct {
-	ID            uuid.UUID   `json:"id"`
 	PullRequestID uuid.UUID   `json:"pull_request_id"`
 	PipelineRunID uuid.UUID   `json:"pipeline_run_id"`
 	TaskType      string      `json:"task_type"`
 	FilePath      string      `json:"file_path"`
-	Symbol        pgtype.Text `json:"symbol"`
+	Symbol        string      `json:"symbol"`
 	RiskScore     float64     `json:"risk_score"`
 	ModelID       string      `json:"model_id"`
 	DiffHunk      pgtype.Text `json:"diff_hunk"`
-	Status        string      `json:"status"`
 }
 
-func (q *Queries) CreateReviewTask(ctx context.Context, arg CreateReviewTaskParams) (time.Time, error) {
+func (q *Queries) CreateReviewTask(ctx context.Context, arg CreateReviewTaskParams) (ReviewTask, error) {
 	row := q.db.QueryRow(ctx, createReviewTask,
-		arg.ID,
 		arg.PullRequestID,
 		arg.PipelineRunID,
 		arg.TaskType,
@@ -45,24 +61,33 @@ func (q *Queries) CreateReviewTask(ctx context.Context, arg CreateReviewTaskPara
 		arg.RiskScore,
 		arg.ModelID,
 		arg.DiffHunk,
-		arg.Status,
 	)
-	var created_at time.Time
-	err := row.Scan(&created_at)
-	return created_at, err
+	var i ReviewTask
+	err := row.Scan(
+		&i.ID,
+		&i.PullRequestID,
+		&i.PipelineRunID,
+		&i.TaskType,
+		&i.FilePath,
+		&i.Symbol,
+		&i.RiskScore,
+		&i.ModelID,
+		&i.DiffHunk,
+		&i.Status,
+		&i.Error,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
-const listPendingReviewTasks = `-- name: ListPendingReviewTasks :many
-SELECT id, pull_request_id, pipeline_run_id, task_type,
-       file_path, symbol, risk_score, model_id, diff_hunk,
-       status, error, started_at, completed_at, created_at
-FROM review_tasks
-WHERE status = 'pending'
-ORDER BY risk_score DESC
+const listReviewTasksForPR = `-- name: ListReviewTasksForPR :many
+SELECT id, pull_request_id, pipeline_run_id, task_type, file_path, symbol, risk_score, model_id, diff_hunk, status, error, started_at, completed_at, created_at FROM review_tasks WHERE pull_request_id = $1
 `
 
-func (q *Queries) ListPendingReviewTasks(ctx context.Context) ([]ReviewTask, error) {
-	rows, err := q.db.Query(ctx, listPendingReviewTasks)
+func (q *Queries) ListReviewTasksForPR(ctx context.Context, pullRequestID uuid.UUID) ([]ReviewTask, error) {
+	rows, err := q.db.Query(ctx, listReviewTasksForPR, pullRequestID)
 	if err != nil {
 		return nil, err
 	}
@@ -96,58 +121,60 @@ func (q *Queries) ListPendingReviewTasks(ctx context.Context) ([]ReviewTask, err
 	return items, nil
 }
 
-const updateReviewTaskStatusOther = `-- name: UpdateReviewTaskStatusOther :execrows
-UPDATE review_tasks
-SET status = $2
-WHERE id = $1
+const listReviewTasksForRun = `-- name: ListReviewTasksForRun :many
+SELECT id, pull_request_id, pipeline_run_id, task_type, file_path, symbol, risk_score, model_id, diff_hunk, status, error, started_at, completed_at, created_at FROM review_tasks WHERE pipeline_run_id = $1
 `
 
-type UpdateReviewTaskStatusOtherParams struct {
-	ID     uuid.UUID `json:"id"`
-	Status string    `json:"status"`
-}
-
-func (q *Queries) UpdateReviewTaskStatusOther(ctx context.Context, arg UpdateReviewTaskStatusOtherParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateReviewTaskStatusOther, arg.ID, arg.Status)
+func (q *Queries) ListReviewTasksForRun(ctx context.Context, pipelineRunID uuid.UUID) ([]ReviewTask, error) {
+	rows, err := q.db.Query(ctx, listReviewTasksForRun, pipelineRunID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []ReviewTask{}
+	for rows.Next() {
+		var i ReviewTask
+		if err := rows.Scan(
+			&i.ID,
+			&i.PullRequestID,
+			&i.PipelineRunID,
+			&i.TaskType,
+			&i.FilePath,
+			&i.Symbol,
+			&i.RiskScore,
+			&i.ModelID,
+			&i.DiffHunk,
+			&i.Status,
+			&i.Error,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
-const updateReviewTaskStatusRunning = `-- name: UpdateReviewTaskStatusRunning :execrows
+const updateReviewTaskStatus = `-- name: UpdateReviewTaskStatus :execrows
 UPDATE review_tasks
-SET status = $2, started_at = now()
+SET status = $2, error = $3, started_at = CASE WHEN $2 = 'running' THEN now() ELSE started_at END,
+    completed_at = CASE WHEN $2 IN ('completed', 'failed') THEN now() ELSE completed_at END
 WHERE id = $1
 `
 
-type UpdateReviewTaskStatusRunningParams struct {
-	ID     uuid.UUID `json:"id"`
-	Status string    `json:"status"`
-}
-
-func (q *Queries) UpdateReviewTaskStatusRunning(ctx context.Context, arg UpdateReviewTaskStatusRunningParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateReviewTaskStatusRunning, arg.ID, arg.Status)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const updateReviewTaskStatusTerminal = `-- name: UpdateReviewTaskStatusTerminal :execrows
-UPDATE review_tasks
-SET status = $2, error = $3, completed_at = now()
-WHERE id = $1
-`
-
-type UpdateReviewTaskStatusTerminalParams struct {
+type UpdateReviewTaskStatusParams struct {
 	ID     uuid.UUID   `json:"id"`
 	Status string      `json:"status"`
 	Error  pgtype.Text `json:"error"`
 }
 
-func (q *Queries) UpdateReviewTaskStatusTerminal(ctx context.Context, arg UpdateReviewTaskStatusTerminalParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateReviewTaskStatusTerminal, arg.ID, arg.Status, arg.Error)
+func (q *Queries) UpdateReviewTaskStatus(ctx context.Context, arg UpdateReviewTaskStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateReviewTaskStatus, arg.ID, arg.Status, arg.Error)
 	if err != nil {
 		return 0, err
 	}

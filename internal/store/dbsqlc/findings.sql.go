@@ -8,7 +8,6 @@ package dbsqlc
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -16,59 +15,49 @@ import (
 
 const createFinding = `-- name: CreateFinding :one
 INSERT INTO findings (
-    id, review_task_id, pull_request_id, pipeline_run_id,
-    file_path, start_line, end_line, symbol,
+    review_task_id, pull_request_id, pipeline_run_id,
+    repo_full_name, file_path, start_line, end_line, symbol,
     category, confidence_tier, confidence_score, severity,
-    title, body, suggestion,
-    location_hash, content_hash, head_sha,
+    title, body, suggestion, location_hash, content_hash, head_sha,
+    suppression_reason,
     model_id, prompt_tokens, completion_tokens, metadata
-) VALUES (
-    $1, $2, $3, $4,
-    $5, $6, $7, $8,
-    $9, $10, $11, $12,
-    $13, $14, $15,
-    $16, $17, $18,
-    $19, $20, $21, $22
 )
-RETURNING created_at, updated_at
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+RETURNING id, review_task_id, pull_request_id, pipeline_run_id, repo_full_name, file_path, start_line, end_line, symbol, category, confidence_tier, confidence_score, severity, title, body, suggestion, location_hash, content_hash, head_sha, posted_at, external_comment_id, addressed_status, suppression_reason, dismissed_at, dismissed_by, model_id, prompt_tokens, completion_tokens, metadata, created_at, updated_at
 `
 
 type CreateFindingParams struct {
-	ID               uuid.UUID       `json:"id"`
-	ReviewTaskID     uuid.UUID       `json:"review_task_id"`
-	PullRequestID    uuid.UUID       `json:"pull_request_id"`
-	PipelineRunID    uuid.UUID       `json:"pipeline_run_id"`
-	FilePath         string          `json:"file_path"`
-	StartLine        pgtype.Int4     `json:"start_line"`
-	EndLine          pgtype.Int4     `json:"end_line"`
-	Symbol           pgtype.Text     `json:"symbol"`
-	Category         string          `json:"category"`
-	ConfidenceTier   string          `json:"confidence_tier"`
-	ConfidenceScore  float64         `json:"confidence_score"`
-	Severity         string          `json:"severity"`
-	Title            string          `json:"title"`
-	Body             string          `json:"body"`
-	Suggestion       pgtype.Text     `json:"suggestion"`
-	LocationHash     string          `json:"location_hash"`
-	ContentHash      pgtype.Text     `json:"content_hash"`
-	HeadSha          string          `json:"head_sha"`
-	ModelID          string          `json:"model_id"`
-	PromptTokens     pgtype.Int4     `json:"prompt_tokens"`
-	CompletionTokens pgtype.Int4     `json:"completion_tokens"`
-	Metadata         json.RawMessage `json:"metadata"`
+	ReviewTaskID      uuid.UUID       `json:"review_task_id"`
+	PullRequestID     uuid.UUID       `json:"pull_request_id"`
+	PipelineRunID     uuid.UUID       `json:"pipeline_run_id"`
+	RepoFullName      string          `json:"repo_full_name"`
+	FilePath          string          `json:"file_path"`
+	StartLine         pgtype.Int4     `json:"start_line"`
+	EndLine           pgtype.Int4     `json:"end_line"`
+	Symbol            string          `json:"symbol"`
+	Category          string          `json:"category"`
+	ConfidenceTier    string          `json:"confidence_tier"`
+	ConfidenceScore   float64         `json:"confidence_score"`
+	Severity          string          `json:"severity"`
+	Title             string          `json:"title"`
+	Body              string          `json:"body"`
+	Suggestion        pgtype.Text     `json:"suggestion"`
+	LocationHash      string          `json:"location_hash"`
+	ContentHash       pgtype.Text     `json:"content_hash"`
+	HeadSha           string          `json:"head_sha"`
+	SuppressionReason pgtype.Text     `json:"suppression_reason"`
+	ModelID           string          `json:"model_id"`
+	PromptTokens      pgtype.Int4     `json:"prompt_tokens"`
+	CompletionTokens  pgtype.Int4     `json:"completion_tokens"`
+	Metadata          json.RawMessage `json:"metadata"`
 }
 
-type CreateFindingRow struct {
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-func (q *Queries) CreateFinding(ctx context.Context, arg CreateFindingParams) (CreateFindingRow, error) {
+func (q *Queries) CreateFinding(ctx context.Context, arg CreateFindingParams) (Finding, error) {
 	row := q.db.QueryRow(ctx, createFinding,
-		arg.ID,
 		arg.ReviewTaskID,
 		arg.PullRequestID,
 		arg.PipelineRunID,
+		arg.RepoFullName,
 		arg.FilePath,
 		arg.StartLine,
 		arg.EndLine,
@@ -83,47 +72,19 @@ func (q *Queries) CreateFinding(ctx context.Context, arg CreateFindingParams) (C
 		arg.LocationHash,
 		arg.ContentHash,
 		arg.HeadSha,
+		arg.SuppressionReason,
 		arg.ModelID,
 		arg.PromptTokens,
 		arg.CompletionTokens,
 		arg.Metadata,
 	)
-	var i CreateFindingRow
-	err := row.Scan(&i.CreatedAt, &i.UpdatedAt)
-	return i, err
-}
-
-const findPriorFinding = `-- name: FindPriorFinding :one
-SELECT f.id, f.review_task_id, f.pull_request_id, f.pipeline_run_id,
-       f.file_path, f.start_line, f.end_line, f.symbol,
-       f.category, f.confidence_tier, f.confidence_score, f.severity,
-       f.title, f.body, f.suggestion,
-       f.location_hash, f.content_hash, f.head_sha,
-       f.posted_at, f.external_comment_id, f.addressed_in_next_commit,
-       f.suppression_reason, f.dismissed_at, f.dismissed_by,
-       f.model_id, f.prompt_tokens, f.completion_tokens, f.metadata,
-       f.created_at, f.updated_at
-FROM findings f
-JOIN pull_requests pr ON f.pull_request_id = pr.id
-WHERE f.location_hash = $1
-  AND pr.repo_full_name = $2
-ORDER BY f.created_at DESC
-LIMIT 1
-`
-
-type FindPriorFindingParams struct {
-	LocationHash string `json:"location_hash"`
-	RepoFullName string `json:"repo_full_name"`
-}
-
-func (q *Queries) FindPriorFinding(ctx context.Context, arg FindPriorFindingParams) (Finding, error) {
-	row := q.db.QueryRow(ctx, findPriorFinding, arg.LocationHash, arg.RepoFullName)
 	var i Finding
 	err := row.Scan(
 		&i.ID,
 		&i.ReviewTaskID,
 		&i.PullRequestID,
 		&i.PipelineRunID,
+		&i.RepoFullName,
 		&i.FilePath,
 		&i.StartLine,
 		&i.EndLine,
@@ -140,7 +101,7 @@ func (q *Queries) FindPriorFinding(ctx context.Context, arg FindPriorFindingPara
 		&i.HeadSha,
 		&i.PostedAt,
 		&i.ExternalCommentID,
-		&i.AddressedInNextCommit,
+		&i.AddressedStatus,
 		&i.SuppressionReason,
 		&i.DismissedAt,
 		&i.DismissedBy,
@@ -154,45 +115,52 @@ func (q *Queries) FindPriorFinding(ctx context.Context, arg FindPriorFindingPara
 	return i, err
 }
 
-const isFingerprintDismissed = `-- name: IsFingerprintDismissed :one
-SELECT EXISTS(
-    SELECT 1 FROM dismissed_fingerprints
-    WHERE fingerprint = $1 AND repo_full_name = $2
-) AS dismissed
+const findPriorFinding = `-- name: FindPriorFinding :one
+SELECT f.id, f.location_hash, f.content_hash, f.head_sha FROM findings f
+JOIN pull_requests pr ON pr.id = f.pull_request_id
+WHERE pr.external_pr_id = (SELECT p.external_pr_id FROM pull_requests p WHERE p.id = $1)
+  AND f.location_hash = $2
+  AND f.addressed_status = 'unaddressed'
+ORDER BY f.created_at DESC
+LIMIT 1
 `
 
-type IsFingerprintDismissedParams struct {
-	Fingerprint  string `json:"fingerprint"`
-	RepoFullName string `json:"repo_full_name"`
+type FindPriorFindingParams struct {
+	ID           uuid.UUID `json:"id"`
+	LocationHash string    `json:"location_hash"`
 }
 
-func (q *Queries) IsFingerprintDismissed(ctx context.Context, arg IsFingerprintDismissedParams) (bool, error) {
-	row := q.db.QueryRow(ctx, isFingerprintDismissed, arg.Fingerprint, arg.RepoFullName)
-	var dismissed bool
-	err := row.Scan(&dismissed)
-	return dismissed, err
+type FindPriorFindingRow struct {
+	ID           uuid.UUID   `json:"id"`
+	LocationHash string      `json:"location_hash"`
+	ContentHash  pgtype.Text `json:"content_hash"`
+	HeadSha      string      `json:"head_sha"`
+}
+
+// Look across all rows for this logical PR (same external_pr_id), not just one
+// pull_request_id. A force-push creates a new pull_requests row with a different
+// UUID but the same external_pr_id, and we must still find prior findings.
+func (q *Queries) FindPriorFinding(ctx context.Context, arg FindPriorFindingParams) (FindPriorFindingRow, error) {
+	row := q.db.QueryRow(ctx, findPriorFinding, arg.ID, arg.LocationHash)
+	var i FindPriorFindingRow
+	err := row.Scan(
+		&i.ID,
+		&i.LocationHash,
+		&i.ContentHash,
+		&i.HeadSha,
+	)
+	return i, err
 }
 
 const listFindingsForPR = `-- name: ListFindingsForPR :many
-SELECT id, review_task_id, pull_request_id, pipeline_run_id,
-       file_path, start_line, end_line, symbol,
-       category, confidence_tier, confidence_score, severity,
-       title, body, suggestion,
-       location_hash, content_hash, head_sha,
-       posted_at, external_comment_id, addressed_in_next_commit,
-       suppression_reason, dismissed_at, dismissed_by,
-       model_id, prompt_tokens, completion_tokens, metadata,
-       created_at, updated_at
-FROM findings
-WHERE pull_request_id = $1
-ORDER BY confidence_score DESC,
-         CASE severity
-             WHEN 'critical' THEN 1
-             WHEN 'high'     THEN 2
-             WHEN 'medium'   THEN 3
-             WHEN 'low'      THEN 4
-             WHEN 'info'     THEN 5
-         END ASC
+SELECT id, review_task_id, pull_request_id, pipeline_run_id, repo_full_name, file_path, start_line, end_line, symbol, category, confidence_tier, confidence_score, severity, title, body, suggestion, location_hash, content_hash, head_sha, posted_at, external_comment_id, addressed_status, suppression_reason, dismissed_at, dismissed_by, model_id, prompt_tokens, completion_tokens, metadata, created_at, updated_at FROM findings WHERE pull_request_id = $1
+ORDER BY CASE severity
+    WHEN 'critical' THEN 1
+    WHEN 'high'     THEN 2
+    WHEN 'medium'   THEN 3
+    WHEN 'low'      THEN 4
+    WHEN 'info'     THEN 5
+END ASC, confidence_score DESC
 `
 
 func (q *Queries) ListFindingsForPR(ctx context.Context, pullRequestID uuid.UUID) ([]Finding, error) {
@@ -209,6 +177,7 @@ func (q *Queries) ListFindingsForPR(ctx context.Context, pullRequestID uuid.UUID
 			&i.ReviewTaskID,
 			&i.PullRequestID,
 			&i.PipelineRunID,
+			&i.RepoFullName,
 			&i.FilePath,
 			&i.StartLine,
 			&i.EndLine,
@@ -225,7 +194,7 @@ func (q *Queries) ListFindingsForPR(ctx context.Context, pullRequestID uuid.UUID
 			&i.HeadSha,
 			&i.PostedAt,
 			&i.ExternalCommentID,
-			&i.AddressedInNextCommit,
+			&i.AddressedStatus,
 			&i.SuppressionReason,
 			&i.DismissedAt,
 			&i.DismissedBy,
@@ -246,25 +215,19 @@ func (q *Queries) ListFindingsForPR(ctx context.Context, pullRequestID uuid.UUID
 	return items, nil
 }
 
-const listUnaddressedFindings = `-- name: ListUnaddressedFindings :many
-SELECT id, review_task_id, pull_request_id, pipeline_run_id,
-       file_path, start_line, end_line, symbol,
-       category, confidence_tier, confidence_score, severity,
-       title, body, suggestion,
-       location_hash, content_hash, head_sha,
-       posted_at, external_comment_id, addressed_in_next_commit,
-       suppression_reason, dismissed_at, dismissed_by,
-       model_id, prompt_tokens, completion_tokens, metadata,
-       created_at, updated_at
-FROM findings
-WHERE pull_request_id = $1
-  AND posted_at IS NOT NULL
-  AND addressed_in_next_commit = FALSE
-ORDER BY created_at ASC
+const listFindingsForRun = `-- name: ListFindingsForRun :many
+SELECT id, review_task_id, pull_request_id, pipeline_run_id, repo_full_name, file_path, start_line, end_line, symbol, category, confidence_tier, confidence_score, severity, title, body, suggestion, location_hash, content_hash, head_sha, posted_at, external_comment_id, addressed_status, suppression_reason, dismissed_at, dismissed_by, model_id, prompt_tokens, completion_tokens, metadata, created_at, updated_at FROM findings WHERE pipeline_run_id = $1
+ORDER BY CASE severity
+    WHEN 'critical' THEN 1
+    WHEN 'high'     THEN 2
+    WHEN 'medium'   THEN 3
+    WHEN 'low'      THEN 4
+    WHEN 'info'     THEN 5
+END ASC, confidence_score DESC
 `
 
-func (q *Queries) ListUnaddressedFindings(ctx context.Context, pullRequestID uuid.UUID) ([]Finding, error) {
-	rows, err := q.db.Query(ctx, listUnaddressedFindings, pullRequestID)
+func (q *Queries) ListFindingsForRun(ctx context.Context, pipelineRunID uuid.UUID) ([]Finding, error) {
+	rows, err := q.db.Query(ctx, listFindingsForRun, pipelineRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -277,6 +240,7 @@ func (q *Queries) ListUnaddressedFindings(ctx context.Context, pullRequestID uui
 			&i.ReviewTaskID,
 			&i.PullRequestID,
 			&i.PipelineRunID,
+			&i.RepoFullName,
 			&i.FilePath,
 			&i.StartLine,
 			&i.EndLine,
@@ -293,7 +257,66 @@ func (q *Queries) ListUnaddressedFindings(ctx context.Context, pullRequestID uui
 			&i.HeadSha,
 			&i.PostedAt,
 			&i.ExternalCommentID,
-			&i.AddressedInNextCommit,
+			&i.AddressedStatus,
+			&i.SuppressionReason,
+			&i.DismissedAt,
+			&i.DismissedBy,
+			&i.ModelID,
+			&i.PromptTokens,
+			&i.CompletionTokens,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUnaddressedFindingsForPR = `-- name: ListUnaddressedFindingsForPR :many
+SELECT id, review_task_id, pull_request_id, pipeline_run_id, repo_full_name, file_path, start_line, end_line, symbol, category, confidence_tier, confidence_score, severity, title, body, suggestion, location_hash, content_hash, head_sha, posted_at, external_comment_id, addressed_status, suppression_reason, dismissed_at, dismissed_by, model_id, prompt_tokens, completion_tokens, metadata, created_at, updated_at FROM findings
+WHERE pull_request_id = $1
+  AND addressed_status = 'unaddressed'
+  AND content_hash IS NOT NULL
+`
+
+func (q *Queries) ListUnaddressedFindingsForPR(ctx context.Context, pullRequestID uuid.UUID) ([]Finding, error) {
+	rows, err := q.db.Query(ctx, listUnaddressedFindingsForPR, pullRequestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Finding{}
+	for rows.Next() {
+		var i Finding
+		if err := rows.Scan(
+			&i.ID,
+			&i.ReviewTaskID,
+			&i.PullRequestID,
+			&i.PipelineRunID,
+			&i.RepoFullName,
+			&i.FilePath,
+			&i.StartLine,
+			&i.EndLine,
+			&i.Symbol,
+			&i.Category,
+			&i.ConfidenceTier,
+			&i.ConfidenceScore,
+			&i.Severity,
+			&i.Title,
+			&i.Body,
+			&i.Suggestion,
+			&i.LocationHash,
+			&i.ContentHash,
+			&i.HeadSha,
+			&i.PostedAt,
+			&i.ExternalCommentID,
+			&i.AddressedStatus,
 			&i.SuppressionReason,
 			&i.DismissedAt,
 			&i.DismissedBy,
@@ -315,24 +338,21 @@ func (q *Queries) ListUnaddressedFindings(ctx context.Context, pullRequestID uui
 }
 
 const listUnpostedFindings = `-- name: ListUnpostedFindings :many
-SELECT id, review_task_id, pull_request_id, pipeline_run_id,
-       file_path, start_line, end_line, symbol,
-       category, confidence_tier, confidence_score, severity,
-       title, body, suggestion,
-       location_hash, content_hash, head_sha,
-       posted_at, external_comment_id, addressed_in_next_commit,
-       suppression_reason, dismissed_at, dismissed_by,
-       model_id, prompt_tokens, completion_tokens, metadata,
-       created_at, updated_at
-FROM findings
-WHERE pull_request_id = $1
-  AND posted_at IS NULL
-  AND suppression_reason IS NULL
-ORDER BY confidence_score DESC
+SELECT f.id, f.review_task_id, f.pull_request_id, f.pipeline_run_id, f.repo_full_name, f.file_path, f.start_line, f.end_line, f.symbol, f.category, f.confidence_tier, f.confidence_score, f.severity, f.title, f.body, f.suggestion, f.location_hash, f.content_hash, f.head_sha, f.posted_at, f.external_comment_id, f.addressed_status, f.suppression_reason, f.dismissed_at, f.dismissed_by, f.model_id, f.prompt_tokens, f.completion_tokens, f.metadata, f.created_at, f.updated_at FROM findings f
+JOIN pipeline_runs pr ON pr.id = f.pipeline_run_id
+WHERE f.pipeline_run_id = $1
+  AND f.posted_at IS NULL
+  AND f.suppression_reason IS NULL
+  AND f.external_comment_id IS NULL
+  AND pr.status = 'completed'
+ORDER BY f.created_at ASC
 `
 
-func (q *Queries) ListUnpostedFindings(ctx context.Context, pullRequestID uuid.UUID) ([]Finding, error) {
-	rows, err := q.db.Query(ctx, listUnpostedFindings, pullRequestID)
+// Finds findings that were persisted but never posted to GitHub.
+// Used by the PostingRetryJob to recover from GitHub API failures.
+// Scoped by pipeline_run_id per CLAUDE.md boundary rule.
+func (q *Queries) ListUnpostedFindings(ctx context.Context, pipelineRunID uuid.UUID) ([]Finding, error) {
+	rows, err := q.db.Query(ctx, listUnpostedFindings, pipelineRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +365,7 @@ func (q *Queries) ListUnpostedFindings(ctx context.Context, pullRequestID uuid.U
 			&i.ReviewTaskID,
 			&i.PullRequestID,
 			&i.PipelineRunID,
+			&i.RepoFullName,
 			&i.FilePath,
 			&i.StartLine,
 			&i.EndLine,
@@ -361,7 +382,7 @@ func (q *Queries) ListUnpostedFindings(ctx context.Context, pullRequestID uuid.U
 			&i.HeadSha,
 			&i.PostedAt,
 			&i.ExternalCommentID,
-			&i.AddressedInNextCommit,
+			&i.AddressedStatus,
 			&i.SuppressionReason,
 			&i.DismissedAt,
 			&i.DismissedBy,
@@ -383,13 +404,16 @@ func (q *Queries) ListUnpostedFindings(ctx context.Context, pullRequestID uuid.U
 }
 
 const markFindingAddressed = `-- name: MarkFindingAddressed :execrows
-UPDATE findings
-SET addressed_in_next_commit = true
-WHERE id = $1
+UPDATE findings SET addressed_status = $2, updated_at = now() WHERE id = $1
 `
 
-func (q *Queries) MarkFindingAddressed(ctx context.Context, id uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, markFindingAddressed, id)
+type MarkFindingAddressedParams struct {
+	ID              uuid.UUID `json:"id"`
+	AddressedStatus string    `json:"addressed_status"`
+}
+
+func (q *Queries) MarkFindingAddressed(ctx context.Context, arg MarkFindingAddressedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markFindingAddressed, arg.ID, arg.AddressedStatus)
 	if err != nil {
 		return 0, err
 	}
@@ -397,13 +421,11 @@ func (q *Queries) MarkFindingAddressed(ctx context.Context, id uuid.UUID) (int64
 }
 
 const markFindingPosted = `-- name: MarkFindingPosted :execrows
-UPDATE findings
-SET posted_at = now(), external_comment_id = $2
-WHERE id = $1
+UPDATE findings SET posted_at = now(), external_comment_id = $2, updated_at = now() WHERE id = $1
 `
 
 type MarkFindingPostedParams struct {
-	ID              uuid.UUID   `json:"id"`
+	ID                uuid.UUID   `json:"id"`
 	ExternalCommentID pgtype.Int8 `json:"external_comment_id"`
 }
 

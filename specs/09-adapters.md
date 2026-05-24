@@ -1,6 +1,6 @@
 # Spec 09: Adapter Interfaces
 
-> **Status:** Draft
+> **Status:** Approved
 > **Date:** 2026-03-27
 > **Package:** `pkg/adapter`
 > **Scratchpad:** Promotes `scratchpad/plugin-interfaces.md` to locked spec
@@ -205,7 +205,7 @@ type StoreAdapter interface {
     MarkFindingAddressed(ctx context.Context, id uuid.UUID, status core.AddressedStatus) error
     FindPriorFinding(ctx context.Context, prID uuid.UUID, locationHash string) (*core.Finding, error)
     ListUnaddressedFindings(ctx context.Context, prID uuid.UUID) ([]core.Finding, error)
-    ListUnpostedFindings(ctx context.Context) ([]core.Finding, error)
+    ListUnpostedFindings(ctx context.Context, pipelineRunID uuid.UUID) ([]core.Finding, error)
 
     // Pipeline run lifecycle
     ReconcileStalePipelineRuns(ctx context.Context, staleThreshold time.Duration) error

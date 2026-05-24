@@ -18,14 +18,14 @@ type PREvent struct {
 	HeadSHA      string `json:"head_sha"`
 	BaseSHA      string `json:"base_sha"`
 	Author       string `json:"author"`
-	Action       string `json:"action"` // "opened" or "synchronize"
+	Action       string `json:"action"` // "opened", "synchronize", or "reopened"
 }
 
 // WebhookHandler receives GitHub webhook events and dispatches PR events
 // via the OnPREvent callback. It validates the HMAC signature and ignores
 // event types / actions that aren't relevant to the review pipeline.
 type WebhookHandler struct {
-	// OnPREvent is called for every PR opened/synchronize event.
+	// OnPREvent is called for every PR opened/synchronize/reopened event.
 	// The serve layer wires this to enqueue a River job.
 	// The context is the HTTP request context, not the server's lifecycle context.
 	OnPREvent func(ctx context.Context, event PREvent) error
@@ -65,7 +65,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	action := event.GetAction()
-	if action != "opened" && action != "synchronize" {
+	if action != "opened" && action != "synchronize" && action != "reopened" {
 		w.WriteHeader(http.StatusOK)
 		return
 	}

@@ -14,9 +14,10 @@ import (
 const dismissFingerprint = `-- name: DismissFingerprint :exec
 INSERT INTO dismissed_fingerprints (fingerprint, repo_full_name, dismissed_by, reason)
 VALUES ($1, $2, $3, $4)
-ON CONFLICT (fingerprint, repo_full_name) DO UPDATE SET
-    dismissed_by = EXCLUDED.dismissed_by,
-    reason       = EXCLUDED.reason
+ON CONFLICT (fingerprint, repo_full_name) DO UPDATE
+SET dismissed_by = EXCLUDED.dismissed_by,
+    reason = EXCLUDED.reason,
+    updated_at = now()
 `
 
 type DismissFingerprintParams struct {
@@ -34,4 +35,23 @@ func (q *Queries) DismissFingerprint(ctx context.Context, arg DismissFingerprint
 		arg.Reason,
 	)
 	return err
+}
+
+const isFingerprintDismissed = `-- name: IsFingerprintDismissed :one
+SELECT EXISTS(
+    SELECT 1 FROM dismissed_fingerprints
+    WHERE fingerprint = $1 AND repo_full_name = $2
+) AS dismissed
+`
+
+type IsFingerprintDismissedParams struct {
+	Fingerprint  string `json:"fingerprint"`
+	RepoFullName string `json:"repo_full_name"`
+}
+
+func (q *Queries) IsFingerprintDismissed(ctx context.Context, arg IsFingerprintDismissedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isFingerprintDismissed, arg.Fingerprint, arg.RepoFullName)
+	var dismissed bool
+	err := row.Scan(&dismissed)
+	return dismissed, err
 }

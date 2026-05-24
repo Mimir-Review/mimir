@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/riverqueue/river"
@@ -42,7 +43,7 @@ func (w *ReviewWorker) Work(ctx context.Context, job *river.Job[ReviewJobArgs]) 
 		BaseSHA:      args.BaseSHA,
 		Author:       args.Author,
 		State:        core.PRStateOpen,
-		Metadata:     map[string]any{},
+		Metadata:     json.RawMessage("{}"),
 	}
 
 	if err := w.Store.UpsertPullRequest(ctx, pr); err != nil {

@@ -1,6 +1,6 @@
 # Spec 07: Store — Database Schema & Persistence
 
-> **Status:** Draft
+> **Status:** Approved
 > **Date:** 2026-03-27
 > **Package:** `internal/store`
 > **Implements:** `pkg/adapter.StoreAdapter`
@@ -269,8 +269,9 @@ WHERE external_pr_id = $1 AND deleted_at IS NULL
 ORDER BY created_at DESC
 LIMIT 1;
 
--- name: SoftDeletePullRequest :exec
-UPDATE pull_requests SET deleted_at = now(), updated_at = now() WHERE id = $1;
+-- name: SoftDeletePullRequest :execrows
+UPDATE pull_requests SET deleted_at = now(), updated_at = now()
+WHERE id = $1 AND deleted_at IS NULL;
 ```
 
 **pipeline_runs.sql:**
@@ -280,7 +281,7 @@ INSERT INTO pipeline_runs (pull_request_id, head_sha, prompt_version, config_has
 VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
--- name: CompletePipelineRun :exec
+-- name: CompletePipelineRun :execrows
 UPDATE pipeline_runs
 SET status = $2, tasks_total = $3, tasks_completed = $4, tasks_failed = $5,
     findings_total = $6, findings_posted = $7, findings_suppressed = $8,
@@ -314,7 +315,7 @@ INSERT INTO review_tasks (pull_request_id, pipeline_run_id, task_type, file_path
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
--- name: UpdateReviewTaskStatus :exec
+-- name: UpdateReviewTaskStatus :execrows
 UPDATE review_tasks
 SET status = $2, error = $3, started_at = CASE WHEN $2 = 'running' THEN now() ELSE started_at END,
     completed_at = CASE WHEN $2 IN ('completed', 'failed') THEN now() ELSE completed_at END
@@ -353,26 +354,45 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $
 RETURNING *;
 
 -- name: ListFindingsForPR :many
-SELECT * FROM findings WHERE pull_request_id = $1 ORDER BY severity, confidence_score DESC;
+SELECT * FROM findings WHERE pull_request_id = $1
+ORDER BY CASE severity
+    WHEN 'critical' THEN 1
+    WHEN 'high'     THEN 2
+    WHEN 'medium'   THEN 3
+    WHEN 'low'      THEN 4
+    WHEN 'info'     THEN 5
+END ASC, confidence_score DESC;
 
 -- name: ListFindingsForRun :many
-SELECT * FROM findings WHERE pipeline_run_id = $1 ORDER BY severity, confidence_score DESC;
+SELECT * FROM findings WHERE pipeline_run_id = $1
+ORDER BY CASE severity
+    WHEN 'critical' THEN 1
+    WHEN 'high'     THEN 2
+    WHEN 'medium'   THEN 3
+    WHEN 'low'      THEN 4
+    WHEN 'info'     THEN 5
+END ASC, confidence_score DESC;
 
--- name: MarkFindingPosted :exec
+-- name: MarkFindingPosted :execrows
 UPDATE findings SET posted_at = now(), external_comment_id = $2, updated_at = now() WHERE id = $1;
 
--- name: MarkFindingAddressed :exec
+-- name: MarkFindingAddressed :execrows
 UPDATE findings SET addressed_status = $2, updated_at = now() WHERE id = $1;
 
 -- name: FindPriorFinding :one
--- Look across all runs for this PR, not just the current one.
+-- Look across all rows for this logical PR (same external_pr_id), not just one
+-- pull_request_id. A force-push creates a new pull_requests row with a different
+-- UUID but the same external_pr_id, and we must still find prior findings.
 -- NOTE: This intentionally does NOT filter on pull_requests.deleted_at.
 -- Soft-deleted PRs' findings are still valid for dedup — suppressing a duplicate
 -- against a soft-deleted PR's finding is correct behavior. The finding existed,
 -- the code was reviewed, and re-flagging it adds noise without value.
-SELECT id, location_hash, content_hash, head_sha FROM findings
-WHERE pull_request_id = $1 AND location_hash = $2 AND addressed_status = 'unaddressed'
-ORDER BY created_at DESC
+SELECT f.id, f.location_hash, f.content_hash, f.head_sha FROM findings f
+JOIN pull_requests pr ON pr.id = f.pull_request_id
+WHERE pr.external_pr_id = (SELECT p.external_pr_id FROM pull_requests p WHERE p.id = $1)
+  AND f.location_hash = $2
+  AND f.addressed_status = 'unaddressed'
+ORDER BY f.created_at DESC
 LIMIT 1;
 
 -- name: ListUnaddressedFindingsForPR :many
@@ -384,15 +404,16 @@ WHERE pull_request_id = $1
 -- name: ListUnpostedFindings :many
 -- Finds findings that were persisted but never posted to GitHub.
 -- Used by the PostingRetryJob to recover from GitHub API failures.
+-- Scoped by pipeline_run_id per the "scope every finding query" boundary rule.
 -- Only considers findings from completed pipeline runs (not in-progress ones)
 -- that are not suppressed and have no external_comment_id.
 SELECT f.* FROM findings f
 JOIN pipeline_runs pr ON pr.id = f.pipeline_run_id
-WHERE f.posted_at IS NULL
+WHERE f.pipeline_run_id = $1
+  AND f.posted_at IS NULL
   AND f.suppression_reason IS NULL
   AND f.external_comment_id IS NULL
   AND pr.status = 'completed'
-  AND f.created_at > now() - interval '7 days'
 ORDER BY f.created_at ASC;
 ```
 

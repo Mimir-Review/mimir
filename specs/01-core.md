@@ -1,6 +1,6 @@
 # Spec 01: Core Domain Types
 
-> **Status:** Draft
+> **Status:** Approved
 > **Date:** 2026-03-27
 > **Package:** `internal/core`
 
